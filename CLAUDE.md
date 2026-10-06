@@ -15,26 +15,29 @@ make lint       # golangci-lint
 
 ## Architecture Overview
 
-mcpproxy is a stdio MCP server that proxies one upstream MCP server. The
-upstream is either a local stdio server, restarted when its executable changes
-so it can be rebuilt without restarting the AI agent, or a remote streamable
-HTTP / SSE server, optionally OAuth-protected. mcpproxy also works as a
-command-line MCP client (`tools`, `call`, `auth`).
+mcpproxy is a stdio MCP server (`mcpproxy serve`) that proxies every backend
+MCP server listed in a user-level TOML config. Backends are local stdio
+commands, restarted when their executable changes so they can be rebuilt
+without restarting the AI agent, or remote streamable HTTP / SSE servers,
+optionally OAuth-protected. Backend tools are exposed as `<server>__<tool>`.
+The config is reloaded while running. mcpproxy also works as a command-line
+MCP client (`tools`, `call`, `auth`).
 
 - **mcpproxy/main.go**: Entry point using Google's subcommands pattern
-- **internal/subcmd/**: `serve` (run the proxy); `tools`/`call` (CLI client, `client.go`); `auth`/`logout` (`auth.go`); `add`/`rm`/`ls`/`check` (allowlist); `help` comes from `subcommands.HelpCommand`. `target.go` turns a target (a URL, or a command after `--`) plus the `-transport`/`-header`/`-env` flags into an `app.Dialer`
+- **internal/config/**: The TOML config (`~/.config/mcpproxy/config.toml` or `$MCPPROXY_CONFIG`). It loads with unknown keys rejected, validates, saves atomically with mode 0600, and expands `${NAME}`. The config is also the allowlist: only listed servers are ever launched or contacted
+- **internal/hub/**: `Hub` owns one `app.Upstream` per configured server. `Apply` diffs a config and starts, stops or restarts backends; `WatchConfig` polls the file. `NewUpstream` builds an upstream from a `config.Server`, and is also used by the CLI
+- **internal/mcptool/**: Publishes all backends' tools on the mcp-go server with the server-name prefix, republishing (and so sending `tools/list_changed`) only when the set actually changes. Also provides the built-in tools `mcpproxy_status`, `mcpproxy_restart` (`register.go`), `mcpproxy_search_tools` and `mcpproxy_call_tool` (`search.go`)
+- **internal/app/**: `Upstream` supervisor for one backend over a `Dialer` (`dialer.go`: `StdioDialer`, `RemoteDialer`). Handles change detection (`fingerprint.go`), restart/launch/crash handling (`upstream.go`), argument validation against the running build's input schemas (`validate.go`), ToolSearch-style ranking (`search.go`), and the stderr tail buffer (`tailbuf.go`)
 - **internal/remote/**: Creates streamable HTTP / SSE clients, chooses the transport, and detects auth errors
 - **internal/auth/**: Credential store (`store.go`, one 0600 file per normalized server URL, which implements mcp-go's `TokenStore`) and the OAuth authorization code + PKCE flow with a loopback callback (`flow.go`)
-- **internal/mcptool/**: Mirrors upstream tools onto the mcp-go server (`SetTools` → `tools/list_changed`) and adds the built-in tools (`register.go`: `mcpproxy_restart`; `search.go`: `mcpproxy_search_tools`, `mcpproxy_call_tool`), configured by `mcptool.Options`
-- **internal/app/**: `Upstream` supervisor over a `Dialer` (`dialer.go`: `StdioDialer`, `RemoteDialer`). Handles change detection (`fingerprint.go`), restart/launch/crash handling (`upstream.go`), argument validation against the running build's input schemas (`validate.go`), ToolSearch-style ranking (`search.go`), and the stderr tail buffer (`tailbuf.go`)
-- **internal/allowlist/**: Allowlist matching (`allowlist.go`) and config editing (`config.go`, atomic save). Loaded from the user-level config (`~/.config/mcpproxy/config.json` or `$MCPPROXY_CONFIG`)
+- **internal/subcmd/**: `serve`; `add`/`rm`/`ls` (`servers.go`); `tools`/`call` (`client.go`); `auth`/`logout` (`auth.go`); config path and credential store (`env.go`)
 - **internal/authtest/**: In-process fake OAuth authorization server + protected MCP server (streamable HTTP and SSE) for tests
 - **internal/apptest/**: Test helper that builds `internal/app/testdata/echoserver` with `-ldflags -X main.variant=...` to simulate rebuilds
 
 ### Key Behaviors
-- `Upstream.CallTool` is the hot path. It stats the watched files, restarts the upstream if they changed or the process is down, checks that the tool exists, validates the arguments, and forwards the call. Failures become tool error results, never JSON-RPC errors.
+- `Upstream.CallTool` is the hot path. It stats the watched files, restarts the backend if they changed or the process is down, checks that the tool exists, validates the arguments, and forwards the call. Failures become tool error results, never JSON-RPC errors. Messages use the prefixed tool names (`Options.ToolPrefix`).
 - A failed restart stops the old process and keeps the last tool list. The next call retries.
-- The allowlist (paths and URLs) is checked at startup and again before every (re)start or reconnect, for every subcommand that connects.
+- Config reload: a server whose definition changed in any way is stopped and started again. An invalid file keeps the current backends and is reported by `mcpproxy_status`. `serve` starts even with a broken or missing config.
 - When a call names an unknown tool or fails validation, the tools are re-listed once before the call is rejected. This handles remote servers whose tools changed without notifying the proxy.
-- Auth errors drop the connection and carry a hint to run `mcpproxy auth <url>`. A `RemoteDialer` reloads stored credentials on every dial, so a running proxy picks up a new `auth` without restarting.
-- The upstream is initialized with `mcp.LATEST_LEGACY_PROTOCOL_VERSION` for broad compatibility with servers under development.
+- Auth errors drop the connection and carry a hint to run `mcpproxy auth <name>`. A `RemoteDialer` reloads stored credentials on every dial.
+- Backends are initialized with `mcp.LATEST_LEGACY_PROTOCOL_VERSION` for broad compatibility with servers under development.

@@ -44,6 +44,9 @@ type Options struct {
 	StartTimeout time.Duration
 	// Stderr receives a stdio upstream's stderr stream. Defaults to io.Discard.
 	Stderr io.Writer
+	// ToolPrefix is prepended to tool names in messages, matching the names
+	// the client sees (e.g. "godev__").
+	ToolPrefix string
 	// ClientName and ClientVersion identify the proxy to the upstream.
 	ClientName    string
 	ClientVersion string
@@ -428,10 +431,10 @@ func (u *Upstream) CallTool(
 		// credentials "mcpproxy auth" has stored in the meantime.
 		u.markCrashed(c, err)
 		return mcp.NewToolResultError(fmt.Sprintf(
-			"mcpproxy: call to upstream tool %q failed: %v", name, u.explain(err),
+			"mcpproxy: call to upstream tool %q failed: %v", u.opts.ToolPrefix+name, u.explain(err),
 		)), nil
 	}
-	msg := fmt.Sprintf("mcpproxy: call to upstream tool %q failed: %v", name, err)
+	msg := fmt.Sprintf("mcpproxy: call to upstream tool %q failed: %v", u.opts.ToolPrefix+name, err)
 	if !u.alive(c) {
 		u.markCrashed(c, err)
 		if tail := u.tail.String(); tail != "" {
@@ -450,6 +453,9 @@ func (u *Upstream) check(req mcp.CallToolRequest) (*client.Client, *mcp.CallTool
 	tool, found := findTool(u.tools, name)
 	schema := u.schemas[name]
 	names := toolNames(u.tools)
+	for i := range names {
+		names[i] = u.opts.ToolPrefix + names[i]
+	}
 	lastErr := u.lastErr
 	u.mu.RUnlock()
 
@@ -463,12 +469,12 @@ func (u *Upstream) check(req mcp.CallToolRequest) (*client.Client, *mcp.CallTool
 		return c, mcp.NewToolResultError(fmt.Sprintf(
 			"mcpproxy: tool %q does not exist on the upstream server (its tools may have "+
 				"changed since you listed them). Available tools: %s",
-			name, strings.Join(names, ", "),
+			u.opts.ToolPrefix+name, strings.Join(names, ", "),
 		))
 	}
 	if schema != nil {
 		if err := validateArguments(schema, req); err != nil {
-			return c, invalidArgumentsResult(tool, err)
+			return c, invalidArgumentsResult(u.opts.ToolPrefix+tool.Name, tool, err)
 		}
 	}
 	return c, nil
@@ -502,7 +508,7 @@ func (u *Upstream) markCrashed(c *client.Client, err error) {
 	go closeQuietly(c)
 }
 
-func invalidArgumentsResult(tool mcp.Tool, err error) *mcp.CallToolResult {
+func invalidArgumentsResult(name string, tool mcp.Tool, err error) *mcp.CallToolResult {
 	schema, _ := inputSchemaJSON(tool)
 	var pretty bytes.Buffer
 	if json.Indent(&pretty, schema, "", "  ") != nil {
@@ -512,7 +518,7 @@ func invalidArgumentsResult(tool mcp.Tool, err error) *mcp.CallToolResult {
 	return mcp.NewToolResultError(fmt.Sprintf(
 		"mcpproxy: arguments for %q do not match the tool's current input schema "+
 			"(it may have changed since you listed it): %v\n\nCurrent input schema:\n%s",
-		tool.Name, err, pretty.String(),
+		name, err, pretty.String(),
 	))
 }
 

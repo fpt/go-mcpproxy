@@ -8,28 +8,34 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/fpt/go-mcpproxy/internal/app"
-	"github.com/fpt/go-mcpproxy/internal/remote"
+	"github.com/fpt/go-mcpproxy/internal/config"
+	"github.com/fpt/go-mcpproxy/internal/hub"
 	"github.com/google/subcommands"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// connect starts an Upstream for one-shot command-line use.
-func connect(ctx context.Context, d app.Dialer, verbose bool) (*app.Upstream, error) {
+// connect starts the upstream of a configured server for one-shot use.
+func connect(
+	ctx context.Context,
+	env *environment,
+	name string,
+	verbose bool,
+) (*app.Upstream, error) {
+	srv, err := env.server(name)
+	if err != nil {
+		return nil, err
+	}
 	stderr := io.Discard
 	if verbose {
 		stderr = os.Stderr
 	}
-	up, err := app.New(app.Options{
-		Dialer:        d,
-		StartTimeout:  30 * time.Second,
-		Stderr:        stderr,
-		ClientVersion: Version,
-	})
+	opts := env.hubOptions(stderr)
+	opts.Settle = 0
+	up, err := hub.NewUpstream(name, srv, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -40,69 +46,80 @@ func connect(ctx context.Context, d app.Dialer, verbose bool) (*app.Upstream, er
 	return up, nil
 }
 
-// ToolsCmd lists the tools of an MCP server.
+// ToolsCmd lists the tools of configured servers.
 type ToolsCmd struct {
-	target  targetFlags
 	query   string
 	json    bool
 	verbose bool
 }
 
 func (*ToolsCmd) Name() string     { return "tools" }
-func (*ToolsCmd) Synopsis() string { return "List the tools of an MCP server." }
+func (*ToolsCmd) Synopsis() string { return "List the tools of MCP servers." }
 func (*ToolsCmd) Usage() string {
-	return `tools [flags] <url>
-tools [flags] -- <command> [args...]:
-  List the tools of a remote server or a stdio server command.
+	return `tools [flags] [<name>...]:
+  List the tools of the named servers, or of every configured server, as
+  "<server>__<tool>" (the names the agent sees through "mcpproxy serve").
 
 `
 }
 
 func (p *ToolsCmd) SetFlags(f *flag.FlagSet) {
-	p.target.setFlags(f)
 	f.StringVar(&p.query, "q", "",
 		`Search query, as for mcpproxy_search_tools ("select:a,b", keywords, "+word")`)
 	f.BoolVar(&p.json, "json", false, "Print full tool definitions as JSON")
-	f.BoolVar(&p.verbose, "v", false, "Show the stderr of a stdio server")
+	f.BoolVar(&p.verbose, "v", false, "Show the stderr of command servers")
 }
 
 func (p *ToolsCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	if f.NArg() == 0 {
-		fmt.Fprint(os.Stderr, p.Usage())
-		f.PrintDefaults()
-		return subcommands.ExitUsageError
-	}
-	env, err := loadEnvironment()
+	env, err := newEnvironment()
 	if err != nil {
 		return fail(err)
 	}
-	dialer, err := p.target.dialer(env, f.Args())
-	if err != nil {
-		return fail(err)
+	names := f.Args()
+	if len(names) == 0 {
+		cfg, err := env.load()
+		if err != nil {
+			return fail(err)
+		}
+		if names = cfg.Names(); len(names) == 0 {
+			return fail(errors.New("no servers are configured (add one with `mcpproxy add`)"))
+		}
 	}
-	up, err := connect(ctx, dialer, p.verbose)
-	if err != nil {
-		return fail(err)
-	}
-	defer func() { _ = up.Close() }()
 
-	tools := up.Tools()
+	var tools []mcp.Tool
+	status := subcommands.ExitSuccess
+	for _, name := range names {
+		up, err := connect(ctx, env, name, p.verbose)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mcpproxy: %s: %v\n", name, err)
+			status = subcommands.ExitFailure
+			continue
+		}
+		for _, t := range up.Tools() {
+			t.Name = name + config.ToolSeparator + t.Name
+			tools = append(tools, t)
+		}
+		_ = up.Close()
+	}
+
 	if p.query != "" {
 		tools = app.SearchTools(tools, p.query, 0).Tools
 	}
 	if p.json {
-		return printJSON(tools)
+		if st := printJSON(tools); st != subcommands.ExitSuccess {
+			return st
+		}
+		return status
 	}
 	for _, t := range tools {
 		desc, _, _ := strings.Cut(strings.TrimSpace(t.Description), "\n")
 		fmt.Printf("%s\t%s\n", t.Name, desc)
 	}
-	return subcommands.ExitSuccess
+	return status
 }
 
-// CallCmd calls a tool of an MCP server.
+// CallCmd calls a tool of a configured server.
 type CallCmd struct {
-	target  targetFlags
 	json    bool
 	verbose bool
 	timeout time.Duration
@@ -111,11 +128,11 @@ type CallCmd struct {
 func (*CallCmd) Name() string     { return "call" }
 func (*CallCmd) Synopsis() string { return "Call a tool of an MCP server." }
 func (*CallCmd) Usage() string {
-	return `call [flags] <url> <tool> [arguments...]
-call [flags] <tool> [arguments...] -- <command> [args...]:
-  Call a tool of a remote server or a stdio server command and print the result.
-  Arguments are checked against the tool's input schema before calling.
-  The exit status is 1 if the tool reports an error.
+	return `call [flags] <name> <tool> [arguments...]
+call [flags] <name>__<tool> [arguments...]:
+  Call a tool of a configured server and print the result. Arguments are
+  checked against the tool's input schema before calling. The exit status is
+  1 if the tool reports an error.
 
   Arguments are either a single JSON object, "-" to read a JSON object from
   stdin, or any number of:
@@ -123,40 +140,37 @@ call [flags] <tool> [arguments...] -- <command> [args...]:
     key:=json     JSON value (number, boolean, array, object, null)
 
   Examples:
-    mcpproxy call https://mcp.example.com/mcp search query='go mcp' limit:=5
-    mcpproxy call echo '{"message": "hi"}' -- ./output/my-server serve
+    mcpproxy call godev search_godoc query=mcp
+    mcpproxy call godev__search_godoc query=mcp
+    mcpproxy call example search query='go mcp' limit:=5
+    echo '{"query": "x"}' | mcpproxy call example search -
 
 `
 }
 
 func (p *CallCmd) SetFlags(f *flag.FlagSet) {
-	p.target.setFlags(f)
 	f.BoolVar(&p.json, "json", false, "Print the raw result as JSON")
-	f.BoolVar(&p.verbose, "v", false, "Show the stderr of a stdio server")
+	f.BoolVar(&p.verbose, "v", false, "Show the stderr of a command server")
 	f.DurationVar(&p.timeout, "timeout", 0, "Timeout for the call (0: none)")
 }
 
 func (p *CallCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	spec, rest, err := splitCallArgs(f.Args())
+	name, tool, rest, err := splitCallArgs(f.Args())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mcpproxy: %v\n\n", err)
 		fmt.Fprint(os.Stderr, p.Usage())
 		return subcommands.ExitUsageError
 	}
-	args, err := parseToolArguments(rest[1:], os.Stdin)
+	args, err := parseToolArguments(rest, os.Stdin)
 	if err != nil {
 		return fail(err)
 	}
 
-	env, err := loadEnvironment()
+	env, err := newEnvironment()
 	if err != nil {
 		return fail(err)
 	}
-	dialer, err := p.target.dialer(env, spec)
-	if err != nil {
-		return fail(err)
-	}
-	up, err := connect(ctx, dialer, p.verbose)
+	up, err := connect(ctx, env, name, p.verbose)
 	if err != nil {
 		return fail(err)
 	}
@@ -168,7 +182,7 @@ func (p *CallCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcom
 		defer cancel()
 	}
 	req := mcp.CallToolRequest{}
-	req.Params.Name = rest[0]
+	req.Params.Name = tool
 	req.Params.Arguments = args
 	res, err := up.CallTool(ctx, req)
 	if err != nil {
@@ -192,23 +206,18 @@ func (p *CallCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcom
 	return subcommands.ExitSuccess
 }
 
-// splitCallArgs separates the target from the tool name and arguments:
-// "<url> <tool> args..." or "<tool> args... -- <command> args...".
-func splitCallArgs(args []string) (spec, rest []string, err error) {
-	if i := slices.Index(args, "--"); i >= 0 {
-		spec, rest = args[i+1:], args[:i]
-	} else if len(args) > 0 && remote.IsURL(args[0]) {
-		spec, rest = args[:1], args[1:]
-	} else {
-		return nil, nil, errors.New("give a server URL first, or the command after --")
+// splitCallArgs accepts "<name> <tool> args..." or "<name>__<tool> args...".
+func splitCallArgs(args []string) (name, tool string, rest []string, err error) {
+	if len(args) == 0 {
+		return "", "", nil, errors.New("missing server name")
 	}
-	if len(spec) == 0 {
-		return nil, nil, errors.New("missing command after --")
+	if n, t, ok := strings.Cut(args[0], config.ToolSeparator); ok && n != "" && t != "" {
+		return n, t, args[1:], nil
 	}
-	if len(rest) == 0 {
-		return nil, nil, errors.New("missing tool name")
+	if len(args) < 2 {
+		return "", "", nil, errors.New("missing tool name")
 	}
-	return spec, rest, nil
+	return args[0], args[1], args[2:], nil
 }
 
 // parseToolArguments builds the arguments object from command-line words.

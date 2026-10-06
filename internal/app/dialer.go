@@ -37,8 +37,8 @@ type StdioDialer struct {
 }
 
 // NewStdioDialer returns a dialer for command. resolve maps the command to
-// the path to execute and enforces the allowlist; it runs on every dial so
-// that a retargeted symlink is re-checked.
+// the path to execute and may reject it; it runs on every dial. A nil resolve
+// locates the command and evaluates its symlinks.
 func NewStdioDialer(
 	command string,
 	args, env []string,
@@ -48,7 +48,18 @@ func NewStdioDialer(
 	if err != nil {
 		return nil, err
 	}
+	if resolve == nil {
+		resolve = resolveExecutable
+	}
 	return &StdioDialer{command: command, args: args, env: env, exe: exe, resolve: resolve}, nil
+}
+
+func resolveExecutable(command string) (string, error) {
+	p, err := exec.LookPath(command)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(p)
 }
 
 // watchPathForCommand returns the absolute path to stat for change
@@ -92,15 +103,16 @@ func (d *StdioDialer) AuthHint() string { return "" }
 
 // RemoteDialer connects to an HTTP or SSE MCP server.
 type RemoteDialer struct {
-	cfg   remote.Config
-	check func(url string) error
-	oauth func(url string) (*transport.OAuthConfig, error)
+	authCmd string
+	cfg     remote.Config
+	check   func(url string) error
+	oauth   func(url string) (*transport.OAuthConfig, error)
 }
 
-// NewRemoteDialer returns a dialer for cfg. check enforces the allowlist and
-// oauth loads stored OAuth credentials (nil config for none); both run on
-// every dial, so credentials stored by "mcpproxy auth" while the proxy is
-// running are picked up on the next reconnect.
+// NewRemoteDialer returns a dialer for cfg. check, if non-nil, may reject
+// the URL, and oauth, if non-nil, loads stored OAuth credentials (nil config
+// for none); both run on every dial, so credentials stored by "mcpproxy auth"
+// while the proxy is running are picked up on the next reconnect.
 func NewRemoteDialer(
 	cfg remote.Config,
 	check func(string) error,
@@ -111,8 +123,10 @@ func NewRemoteDialer(
 
 // Dial implements Dialer.
 func (d *RemoteDialer) Dial(ctx context.Context, _ io.Writer) (*client.Client, error) {
-	if err := d.check(d.cfg.URL); err != nil {
-		return nil, err
+	if d.check != nil {
+		if err := d.check(d.cfg.URL); err != nil {
+			return nil, err
+		}
 	}
 	cfg := d.cfg
 	if d.oauth != nil {
@@ -131,11 +145,15 @@ func (d *RemoteDialer) WatchPaths() []string { return nil }
 // String implements Dialer.
 func (d *RemoteDialer) String() string { return d.cfg.URL }
 
+// SetAuthCommand sets the command suggested by AuthHint, e.g.
+// "mcpproxy auth <server name>".
+func (d *RemoteDialer) SetAuthCommand(cmd string) { d.authCmd = cmd }
+
 // AuthHint implements Dialer.
 func (d *RemoteDialer) AuthHint() string {
-	cmd := "mcpproxy auth " + d.cfg.URL
-	if d.cfg.Transport != remote.TransportAuto {
-		cmd = "mcpproxy auth -transport " + d.cfg.Transport + " " + d.cfg.URL
+	cmd := d.authCmd
+	if cmd == "" {
+		cmd = "mcpproxy auth " + d.cfg.URL
 	}
 	return fmt.Sprintf("The server requires authorization. Run `%s` in a terminal "+
 		"(ask the user to do so if you are an AI agent), then retry.", cmd)

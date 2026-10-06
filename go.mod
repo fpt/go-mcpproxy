@@ -3,6 +3,7 @@ module github.com/fpt/go-mcpproxy
 go 1.27.1
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/google/subcommands v1.2.0
 	github.com/mark3labs/mcp-go v1.1.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3

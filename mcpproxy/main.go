@@ -21,7 +21,6 @@ func main() {
 	subcommands.Register(&subcmd.AddCmd{}, "allowlist")
 	subcommands.Register(&subcmd.RmCmd{}, "allowlist")
 	subcommands.Register(&subcmd.LsCmd{}, "allowlist")
-	subcommands.Register(&subcmd.CheckCmd{}, "allowlist")
 
 	flag.Parse()
 	ctx := context.Background()

@@ -19,39 +19,36 @@ import (
 
 func TestSplitCallArgs(t *testing.T) {
 	tests := []struct {
-		name     string
-		args     []string
-		spec     []string
-		rest     []string
-		hasError bool
+		name       string
+		args       []string
+		server     string
+		tool       string
+		rest       []string
+		wantErrMsg string
 	}{
+		{"separate", []string{"godev", "search", "q=1"}, "godev", "search", []string{"q=1"}, ""},
+		{"prefixed", []string{"godev__search", "q=1"}, "godev", "search", []string{"q=1"}, ""},
 		{
-			"url",
-			[]string{"https://x/mcp", "tool", "a=1"},
-			[]string{"https://x/mcp"},
-			[]string{"tool", "a=1"},
-			false,
+			"tool with underscores",
+			[]string{"godev__read_go_doc"},
+			"godev",
+			"read_go_doc",
+			[]string{},
+			"",
 		},
-		{
-			"command",
-			[]string{"tool", "a=1", "--", "./srv", "serve"},
-			[]string{"./srv", "serve"},
-			[]string{"tool", "a=1"},
-			false,
-		},
-		{"no target", []string{"tool", "a=1"}, nil, nil, true},
-		{"no tool", []string{"https://x/mcp"}, nil, nil, true},
-		{"no command", []string{"tool", "--"}, nil, nil, true},
+		{"no server", nil, "", "", nil, "missing server name"},
+		{"no tool", []string{"godev"}, "", "", nil, "missing tool name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			spec, rest, err := subcmd.SplitCallArgs(tt.args)
-			if tt.hasError {
-				assert.Error(t, err)
+			server, tool, rest, err := subcmd.SplitCallArgs(tt.args)
+			if tt.wantErrMsg != "" {
+				assert.ErrorContains(t, err, tt.wantErrMsg)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tt.spec, spec)
+			assert.Equal(t, tt.server, server)
+			assert.Equal(t, tt.tool, tool)
 			assert.Equal(t, tt.rest, rest)
 		})
 	}
@@ -108,9 +105,61 @@ func run(t *testing.T, cmd subcommands.Command, args ...string) (subcommands.Exi
 	return status, <-done
 }
 
-func setConfig(t *testing.T) {
+func setConfig(t *testing.T) string {
 	t.Helper()
-	t.Setenv("MCPPROXY_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	path := filepath.Join(t.TempDir(), "config.toml")
+	t.Setenv("MCPPROXY_CONFIG", path)
+	return path
+}
+
+func TestServerCommands(t *testing.T) {
+	path := setConfig(t)
+	bin := filepath.Join(t.TempDir(), "srv")
+
+	st, out := run(t, &subcmd.LsCmd{})
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Empty(t, out)
+
+	st, out = run(t, &subcmd.AddCmd{}, "-env", "A=1", "local", "--", bin, "serve", "-v")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "added: local\t"+bin+" serve -v\n", out)
+
+	st, _ = run(t, &subcmd.AddCmd{}, "-header", "X-Key: ${K}", "api", "https://api.example.com/mcp")
+	require.Equal(t, subcommands.ExitSuccess, st)
+
+	st, out = run(t, &subcmd.AddCmd{}, "api", "https://api.example.com/v2/mcp")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Contains(t, out, "updated: api")
+
+	st, out = run(t, &subcmd.LsCmd{}, "-v")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "# config: "+path+"\n"+
+		"api\thttps://api.example.com/v2/mcp\n"+
+		"local\t"+bin+" serve -v\t(missing)\n", out)
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "[servers.local]")
+	assert.Contains(t, string(data), `args = ["serve", "-v"]`)
+
+	for _, bad := range [][]string{
+		{"bad__name", "--", bin},
+		{"x", "https://a/mcp", "extra"},
+		{"-env", "A=1", "x", "https://a/mcp"},
+		{"-header", "H: v", "x", "--", bin},
+		{"x"},
+	} {
+		st, _ := run(t, &subcmd.AddCmd{}, bad...)
+		assert.NotEqual(t, subcommands.ExitSuccess, st, bad)
+	}
+
+	st, _ = run(t, &subcmd.RmCmd{}, "api", "nope")
+	assert.Equal(t, subcommands.ExitFailure, st, "nothing removed if one name is unknown")
+	st, _ = run(t, &subcmd.RmCmd{}, "api")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	st, out = run(t, &subcmd.LsCmd{})
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "local\t"+bin+" serve -v\n", out)
 }
 
 func TestRemoteCommandsEndToEnd(t *testing.T) {
@@ -118,32 +167,36 @@ func TestRemoteCommandsEndToEnd(t *testing.T) {
 	setConfig(t)
 	defer subcmd.SetOpenBrowser(authtest.Browser)()
 
-	st, _ := run(t, &subcmd.ToolsCmd{}, srv.MCPURL())
-	assert.Equal(t, subcommands.ExitFailure, st, "not in allowlist yet")
+	st, _ := run(t, &subcmd.ToolsCmd{}, "remote")
+	assert.Equal(t, subcommands.ExitFailure, st, "not configured yet")
 
-	st, _ = run(t, &subcmd.AddCmd{}, srv.URL+"/*")
+	st, _ = run(t, &subcmd.AddCmd{}, "remote", srv.MCPURL())
 	require.Equal(t, subcommands.ExitSuccess, st)
 
-	st, _ = run(t, &subcmd.ToolsCmd{}, srv.MCPURL())
+	st, _ = run(t, &subcmd.ToolsCmd{}, "remote")
 	assert.Equal(t, subcommands.ExitFailure, st, "not authorized yet")
 
-	st, _ = run(t, &subcmd.AuthCmd{}, "-timeout", "10s", srv.MCPURL())
+	st, _ = run(t, &subcmd.AuthCmd{}, "-timeout", "10s", "remote")
 	require.Equal(t, subcommands.ExitSuccess, st)
 
-	st, out := run(t, &subcmd.ToolsCmd{}, srv.MCPURL())
+	st, out := run(t, &subcmd.LsCmd{}, "-v")
 	require.Equal(t, subcommands.ExitSuccess, st)
-	assert.Equal(t, "whoami\t\n", out)
+	assert.Contains(t, out, "(authorized)")
 
-	st, out = run(t, &subcmd.CallCmd{}, srv.MCPURL(), "whoami", "greeting=hi")
+	st, out = run(t, &subcmd.ToolsCmd{}, "remote")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "remote__whoami\t\n", out)
+
+	st, out = run(t, &subcmd.CallCmd{}, "remote", "whoami", "greeting=hi")
 	require.Equal(t, subcommands.ExitSuccess, st)
 	assert.True(t, strings.HasPrefix(out, "hi access-"), out)
 
-	st, _ = run(t, &subcmd.CallCmd{}, srv.MCPURL(), "whoami", "greeting:=1")
+	st, _ = run(t, &subcmd.CallCmd{}, "remote__whoami", "greeting:=1")
 	assert.Equal(t, subcommands.ExitFailure, st, "schema validation rejects a number")
 
-	st, _ = run(t, &subcmd.LogoutCmd{}, srv.MCPURL())
+	st, _ = run(t, &subcmd.LogoutCmd{}, "remote")
 	require.Equal(t, subcommands.ExitSuccess, st)
-	st, _ = run(t, &subcmd.ToolsCmd{}, srv.MCPURL())
+	st, _ = run(t, &subcmd.ToolsCmd{}, "remote")
 	assert.Equal(t, subcommands.ExitFailure, st, "credentials deleted")
 }
 
@@ -151,40 +204,49 @@ func TestStaticHeaderAuth(t *testing.T) {
 	srv := authtest.NewServer(t)
 	setConfig(t)
 	defer subcmd.SetOpenBrowser(authtest.Browser)()
-	st, _ := run(t, &subcmd.AddCmd{}, srv.MCPURL())
-	require.Equal(t, subcommands.ExitSuccess, st)
 
 	// Obtain a token through the OAuth flow, then use it as a static header
-	// without stored credentials.
-	st, _ = run(t, &subcmd.AuthCmd{}, srv.MCPURL())
+	// (via an environment variable) without stored credentials.
+	st, _ := run(t, &subcmd.AddCmd{}, "oauth", srv.MCPURL())
 	require.Equal(t, subcommands.ExitSuccess, st)
-	st, out := run(t, &subcmd.CallCmd{}, srv.MCPURL(), "whoami")
+	st, _ = run(t, &subcmd.AuthCmd{}, "oauth")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	st, out := run(t, &subcmd.CallCmd{}, "oauth", "whoami")
 	require.Equal(t, subcommands.ExitSuccess, st)
 	token := strings.TrimSpace(strings.TrimPrefix(out, "hello "))
-	st, _ = run(t, &subcmd.LogoutCmd{}, srv.MCPURL())
+	st, _ = run(t, &subcmd.LogoutCmd{}, "oauth")
 	require.Equal(t, subcommands.ExitSuccess, st)
 
-	st, out = run(t, &subcmd.CallCmd{}, "-header", "Authorization: Bearer "+token,
-		srv.MCPURL(), "whoami")
+	t.Setenv("MCPPROXY_TEST_TOKEN", token)
+	st, _ = run(t, &subcmd.AddCmd{}, "-header", "Authorization: Bearer ${MCPPROXY_TEST_TOKEN}",
+		"static", srv.MCPURL())
+	require.Equal(t, subcommands.ExitSuccess, st)
+	st, out = run(t, &subcmd.CallCmd{}, "static", "whoami")
 	require.Equal(t, subcommands.ExitSuccess, st)
 	assert.Equal(t, "hello "+token+"\n", out)
 }
 
 func TestStdioCommands(t *testing.T) {
-	bin := filepath.Join(t.TempDir(), "echoserver")
-	apptest.BuildEchoServer(t, bin, "v1")
+	dir := t.TempDir()
 	setConfig(t)
-	st, _ := run(t, &subcmd.AddCmd{}, bin)
-	require.Equal(t, subcommands.ExitSuccess, st)
+	for _, name := range []string{"one", "two"} {
+		bin := filepath.Join(dir, name)
+		apptest.BuildEchoServer(t, bin, "v1")
+		st, _ := run(t, &subcmd.AddCmd{}, name, "--", bin)
+		require.Equal(t, subcommands.ExitSuccess, st)
+	}
 
-	st, out := run(t, &subcmd.ToolsCmd{}, "-q", "echo", "--", bin)
+	st, out := run(t, &subcmd.ToolsCmd{}, "-q", "echo")
 	require.Equal(t, subcommands.ExitSuccess, st)
-	assert.Equal(t, "echo\t\n", out)
+	assert.Equal(t, "one__echo\t\ntwo__echo\t\n", out)
 
-	st, out = run(t, &subcmd.CallCmd{}, "echo", "message=hi", "--", bin)
+	st, out = run(t, &subcmd.CallCmd{}, "two", "echo", "message=hi")
 	require.Equal(t, subcommands.ExitSuccess, st)
 	assert.Equal(t, "v1:hi\n", out)
 
-	st, _ = run(t, &subcmd.CallCmd{}, "echo", "--", bin)
+	st, _ = run(t, &subcmd.CallCmd{}, "one__echo")
 	assert.Equal(t, subcommands.ExitFailure, st, "missing required argument")
+
+	st, _ = run(t, &subcmd.CallCmd{}, "three", "echo")
+	assert.Equal(t, subcommands.ExitFailure, st, "unknown server")
 }

@@ -7,31 +7,37 @@ import (
 	"strings"
 
 	"github.com/fpt/go-mcpproxy/internal/app"
+	"github.com/fpt/go-mcpproxy/internal/hub"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 const defaultMaxResults = 5
 
-func searchToolDef(opts Options) mcp.Tool {
+func serverList(names []string) string {
+	if len(names) == 0 {
+		return "(none configured yet)"
+	}
+	return strings.Join(names, ", ")
+}
+
+func searchToolDef(servers []string) mcp.Tool {
 	desc := fmt.Sprintf(
-		"Search the tools of the MCP server %s, which is under development behind mcpproxy. "+
-			"Its tools change when it is rebuilt, so the client's own tool search may not see "+
-			"them or may have outdated schemas. This searches the build that is running now "+
-			"and returns full tool definitions.\n\n"+
+		"Search the tools of the MCP servers behind mcpproxy (servers: %s). Their tools "+
+			"change when a server is rebuilt or the proxy's config changes, so the client's "+
+			"own tool search may not see them or may have outdated schemas. This searches "+
+			"what is running now and returns full tool definitions. Tool names are "+
+			"\"<server>__<tool>\".\n\n"+
 			"Query forms:\n"+
 			"- \"select:name1,name2\": fetch these exact tools by name\n"+
 			"- \"keyword another\": keyword search, up to max_results best matches\n"+
 			"- \"+word keyword\": require \"word\" in the tool name, rank by remaining terms\n"+
-			"- \"\": list all tools",
-		opts.ServerName,
+			"  (e.g. \"+godev__ search\" searches only the server godev)\n"+
+			"- \"\": list all tools\n\n"+
+			"Call a found tool directly if you have it, otherwise via %s.",
+		serverList(servers), CallTool,
 	)
-	if opts.CallTool != "" {
-		desc += fmt.Sprintf("\n\nCall a found tool directly if you have it, otherwise via %s.",
-			opts.CallTool)
-	}
-	return mcp.NewTool(
-		opts.SearchTool,
+	return mcp.NewTool(SearchTool,
 		mcp.WithDescription(desc),
 		mcp.WithString("query", mcp.Required(),
 			mcp.Description(`Search query; see the tool description for the forms.`)),
@@ -45,54 +51,63 @@ func searchToolDef(opts Options) mcp.Tool {
 	)
 }
 
-func searchHandler(u *app.Upstream, opts Options) server.ToolHandlerFunc {
+func searchHandler(h *hub.Hub) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query := req.GetString("query", "")
 		maxResults := req.GetInt("max_results", defaultMaxResults)
 
-		refreshErr := u.Refresh(ctx)
-		tools := u.Tools()
-		if refreshErr != nil && len(tools) == 0 {
-			return mcp.NewToolResultError(fmt.Sprintf(
-				"mcpproxy: upstream is not running: %v", refreshErr,
-			)), nil
+		var tools []mcp.Tool
+		var warnings []string
+		for _, b := range h.Backends() {
+			if b.Upstream == nil {
+				warnings = append(warnings, fmt.Sprintf("%s: not usable: %v", b.Name, b.Err))
+				continue
+			}
+			if err := b.Upstream.Refresh(ctx); err != nil {
+				warnings = append(warnings, fmt.Sprintf("%s: not running (showing its last known "+
+					"tools, if any): %v", b.Name, firstLine(err.Error())))
+			}
+			for _, t := range b.Upstream.Tools() {
+				tools = append(tools, prefixed(b.Name, t))
+			}
 		}
 
 		res := app.SearchTools(tools, query, maxResults)
-		var b strings.Builder
-		if refreshErr != nil {
-			fmt.Fprintf(&b, "warning: the latest build failed to start; these are the tools "+
-				"of the last good build: %v\n\n", refreshErr)
+		var sb strings.Builder
+		for _, w := range warnings {
+			fmt.Fprintf(&sb, "warning: %s\n", w)
 		}
-		fmt.Fprintf(&b, "%d of %d matching tools (%d tools total)", len(res.Tools), res.Total,
+		if len(warnings) > 0 {
+			fmt.Fprintf(&sb, "(see %s for details)\n\n", StatusTool)
+		}
+		fmt.Fprintf(&sb, "%d of %d matching tools (%d tools total)", len(res.Tools), res.Total,
 			len(tools))
 		if len(res.Missing) > 0 {
-			fmt.Fprintf(&b, "; not found: %s", strings.Join(res.Missing, ", "))
+			fmt.Fprintf(&sb, "; not found: %s", strings.Join(res.Missing, ", "))
 		}
-		b.WriteString("\n")
+		sb.WriteString("\n")
 		if len(res.Tools) == 0 {
-			fmt.Fprintf(&b, "available tools: %s\n", strings.Join(toolNames(tools), ", "))
-		} else {
-			b.WriteString("<functions>\n")
-			for _, t := range res.Tools {
-				line, err := json.Marshal(toolDefinition(t))
-				if err != nil {
-					return nil, fmt.Errorf("encode tool %q: %w", t.Name, err)
-				}
-				fmt.Fprintf(&b, "<function>%s</function>\n", line)
-			}
-			b.WriteString("</functions>\n")
-			if opts.CallTool != "" {
-				fmt.Fprintf(
-					&b,
-					"\nIf a tool is not in your tool list (or its schema there differs), "+
-						"call it with %s {\"name\": ..., \"arguments\": {...}}.\n",
-					opts.CallTool,
-				)
-			}
+			fmt.Fprintf(&sb, "available tools: %s\n", strings.Join(toolNames(tools), ", "))
+			return mcp.NewToolResultText(sb.String()), nil
 		}
-		return mcp.NewToolResultText(b.String()), nil
+		sb.WriteString("<functions>\n")
+		for _, t := range res.Tools {
+			line, err := json.Marshal(toolDefinition(t))
+			if err != nil {
+				return nil, fmt.Errorf("encode tool %q: %w", t.Name, err)
+			}
+			fmt.Fprintf(&sb, "<function>%s</function>\n", line)
+		}
+		sb.WriteString("</functions>\n")
+		fmt.Fprintf(&sb, "\nIf a tool is not in your tool list (or its schema there differs), "+
+			"call it with %s {\"name\": ..., \"arguments\": {...}}.\n", CallTool)
+		return mcp.NewToolResultText(sb.String()), nil
 	}
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	return line
 }
 
 // definition is the subset of a tool definition an agent needs to call it.
@@ -110,46 +125,52 @@ func toolDefinition(t mcp.Tool) definition {
 	return definition{Name: t.Name, Description: t.Description, InputSchema: schema}
 }
 
-func callToolDef(opts Options) mcp.Tool {
+func callToolDef(servers []string) mcp.Tool {
 	desc := fmt.Sprintf(
-		"Call a tool of the MCP server %s, which is under development behind mcpproxy, by name. "+
-			"Use this for tools that are missing from your tool list or whose schema there is "+
-			"outdated because the server was rebuilt.",
-		opts.ServerName,
+		"Call a tool of an MCP server behind mcpproxy (servers: %s) by its full name "+
+			"\"<server>__<tool>\". Use this for tools that are missing from your tool list or "+
+			"whose schema there is outdated because the server was rebuilt or reconfigured. "+
+			"Find tools and their current schemas with %s.",
+		serverList(servers), SearchTool,
 	)
-	if opts.SearchTool != "" {
-		desc += fmt.Sprintf(" Find tools and their current schemas with %s.", opts.SearchTool)
-	}
-	return mcp.NewTool(
-		opts.CallTool,
+	return mcp.NewTool(CallTool,
 		mcp.WithDescription(desc),
-		mcp.WithString("name", mcp.Required(), mcp.Description("Tool name")),
+		mcp.WithString("name", mcp.Required(), mcp.Description(`Tool name, "<server>__<tool>"`)),
 		mcp.WithObject("arguments",
 			mcp.Description("Tool arguments, matching the tool's input schema")),
 		mcp.WithTitleAnnotation("Call proxied MCP server tool"),
 	)
 }
 
-func callHandler(u *app.Upstream, opts Options) server.ToolHandlerFunc {
+func callHandler(h *hub.Hub) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		name, err := req.RequireString("name")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		if opts.reserved(name) {
+		serverName, toolName, ok := splitToolName(name)
+		if !ok {
 			return mcp.NewToolResultError(fmt.Sprintf(
-				"mcpproxy: %q is a proxy built-in tool; call it directly", name,
+				"mcpproxy: %q is not a proxied tool name; use \"<server>__<tool>\" "+
+					"(built-in tools are called directly)", name,
 			)), nil
+		}
+		b, found := h.Get(serverName)
+		if !found {
+			return mcp.NewToolResultError(unknownServer(h, serverName)), nil
+		}
+		if b.Upstream == nil {
+			return mcp.NewToolResultError(formatStatus(b)), nil
 		}
 		var args any
 		if v, ok := req.GetArguments()["arguments"]; ok && v != nil {
 			args = v
 		}
 		inner := mcp.CallToolRequest{}
-		inner.Params.Name = name
+		inner.Params.Name = toolName
 		inner.Params.Arguments = args
 		inner.Params.Meta = req.Params.Meta
-		return u.CallTool(ctx, inner)
+		return b.Upstream.CallTool(ctx, inner)
 	}
 }
 
