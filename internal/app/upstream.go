@@ -169,6 +169,15 @@ func (u *Upstream) Restart(ctx context.Context) error {
 	return u.restart(ctx, true)
 }
 
+// Refresh restarts the upstream if a rebuild was detected or the process is
+// not running, so that Tools reflects the build on disk.
+func (u *Upstream) Refresh(ctx context.Context) error {
+	if !u.stale() {
+		return nil
+	}
+	return u.restart(ctx, false)
+}
+
 // Close stops the upstream process.
 func (u *Upstream) Close() error {
 	u.restartMu.Lock()
@@ -419,12 +428,10 @@ func (u *Upstream) CallTool(
 	ctx context.Context,
 	req mcp.CallToolRequest,
 ) (*mcp.CallToolResult, error) {
-	if u.stale() {
-		if err := u.restart(ctx, false); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf(
-				"mcpproxy: upstream %s could not be (re)started: %v", u.opts.Command, err,
-			)), nil
-		}
+	if err := u.Refresh(ctx); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"mcpproxy: upstream %s could not be (re)started: %v", u.opts.Command, err,
+		)), nil
 	}
 
 	name := req.Params.Name

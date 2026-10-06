@@ -16,30 +16,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestProxyEndToEnd(t *testing.T) {
+var testOptions = mcptool.Options{
+	RestartTool: "mcpproxy_restart",
+	SearchTool:  "mcpproxy_search_tools",
+	CallTool:    "mcpproxy_call_tool",
+	ServerName:  "echoserver",
+}
+
+type proxy struct {
+	bin         string
+	up          *app.Upstream
+	client      *client.Client
+	listChanged chan struct{}
+}
+
+// newProxy starts the echoserver fixture (variant v1) behind a proxy server
+// and connects an in-process client to it.
+func newProxy(t *testing.T) *proxy {
+	t.Helper()
 	ctx := context.Background()
-	bin := filepath.Join(t.TempDir(), "echoserver")
-	apptest.BuildEchoServer(t, bin, "v1")
+	p := &proxy{
+		bin:         filepath.Join(t.TempDir(), "echoserver"),
+		listChanged: make(chan struct{}, 8),
+	}
+	apptest.BuildEchoServer(t, p.bin, "v1")
 
 	up, err := app.New(app.Options{
-		Command: bin,
+		Command: p.bin,
 		Settle:  50 * time.Millisecond,
 		Resolve: func(c string) (string, error) { return filepath.EvalSymlinks(c) },
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = up.Close() })
 	require.NoError(t, up.Start(ctx))
+	p.up = up
 
 	s := server.NewMCPServer("proxy", "test", server.WithToolCapabilities(true))
-	mcptool.Register(s, up, "mcpproxy_restart")
+	mcptool.Register(s, up, testOptions)
 
 	c, err := client.NewInProcessClient(s)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
-	listChanged := make(chan struct{}, 8)
 	c.OnNotification(func(n mcp.JSONRPCNotification) {
 		if n.Method == string(mcp.MethodNotificationToolsListChanged) {
-			listChanged <- struct{}{}
+			p.listChanged <- struct{}{}
 		}
 	})
 	require.NoError(t, c.Start(ctx))
@@ -48,8 +68,29 @@ func TestProxyEndToEnd(t *testing.T) {
 		ClientInfo:      mcp.Implementation{Name: "test"},
 	}})
 	require.NoError(t, err)
+	p.client = c
+	return p
+}
 
-	assert.ElementsMatch(t, []string{"echo", "crash", "mcpproxy_restart"}, listNames(t, c))
+func (p *proxy) call(t *testing.T, name string, args map[string]any) (string, bool) {
+	t.Helper()
+	req := mcp.CallToolRequest{}
+	req.Params.Name = name
+	req.Params.Arguments = args
+	res, err := p.client.CallTool(context.Background(), req)
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Content)
+	return res.Content[0].(mcp.TextContent).Text, res.IsError
+}
+
+func TestProxyEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	p := newProxy(t)
+	c, up, bin, listChanged := p.client, p.up, p.bin, p.listChanged
+
+	assert.ElementsMatch(t, []string{
+		"echo", "crash", "mcpproxy_restart", "mcpproxy_search_tools", "mcpproxy_call_tool",
+	}, listNames(t, c))
 
 	watchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -95,4 +136,46 @@ func listNames(t *testing.T, c *client.Client) []string {
 		names = append(names, tool.Name)
 	}
 	return names
+}
+
+// TestSearchAndCallAfterUnseenRebuild covers a client whose tool list is
+// stale: the rebuild happens without the background watcher, so no
+// list_changed is sent, yet search and call reach the new build.
+func TestSearchAndCallAfterUnseenRebuild(t *testing.T) {
+	p := newProxy(t)
+	apptest.BuildEchoServer(t, p.bin, "v2")
+
+	out, isErr := p.call(t, "mcpproxy_search_tools", map[string]any{"query": "echo"})
+	require.False(t, isErr, out)
+	assert.Contains(t, out, "1 of 1 matching tools (2 tools total)")
+	assert.Contains(t, out, `<function>{"name":"echo","parameters":{`)
+	assert.Contains(t, out, `"text"`)
+	assert.NotContains(t, out, `"message"`)
+
+	out, isErr = p.call(t, "mcpproxy_search_tools", map[string]any{"query": "select:echo,gone"})
+	require.False(t, isErr, out)
+	assert.Contains(t, out, "not found: gone")
+
+	out, isErr = p.call(t, "mcpproxy_search_tools", map[string]any{"query": "nothing-matches"})
+	require.False(t, isErr, out)
+	assert.Contains(t, out, "available tools: crash, echo")
+
+	out, isErr = p.call(t, "mcpproxy_call_tool", map[string]any{
+		"name":      "echo",
+		"arguments": map[string]any{"text": "via call", "upper": true},
+	})
+	require.False(t, isErr, out)
+	assert.Equal(t, "v2:VIA CALL", out)
+
+	// Arguments are still validated against the running build.
+	out, isErr = p.call(t, "mcpproxy_call_tool", map[string]any{
+		"name":      "echo",
+		"arguments": map[string]any{"message": "old shape"},
+	})
+	assert.True(t, isErr)
+	assert.Contains(t, out, "missing property 'text'")
+
+	out, isErr = p.call(t, "mcpproxy_call_tool", map[string]any{"name": "mcpproxy_restart"})
+	assert.True(t, isErr)
+	assert.Contains(t, out, "proxy built-in tool")
 }

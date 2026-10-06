@@ -93,6 +93,8 @@ mcpproxy serve [flags] -- <command> [args...]
 | `-settle` | `300ms` | How long watched files must be unchanged before restarting |
 | `-start-timeout` | `30s` | Timeout for upstream initialize + tools/list |
 | `-restart-tool` | `mcpproxy_restart` | Name of the built-in restart/status tool; empty disables it |
+| `-search-tool` | `mcpproxy_search_tools` | Name of the built-in tool search; empty disables it |
+| `-call-tool` | `mcpproxy_call_tool` | Name of the built-in call-by-name tool; empty disables it |
 | `-name` | `mcpproxy:<command>` | Server name reported to the client |
 | `-debug` / `-logfile` | | Debug logging / log to a file instead of stderr |
 
@@ -104,6 +106,28 @@ claude mcp add my-server -- mcpproxy serve -- ~/src/my-mcp-server/output/my-mcp-
 
 Then run `make build` in your server's repository. The next tool call uses
 the new build.
+
+### `mcpproxy_search_tools` and `mcpproxy_call_tool`
+
+Claude Code's built-in ToolSearch only indexes the tool definitions it
+received when it connected. It does not find tools that a rebuild added or
+changed behind the proxy, and the agent cannot call a tool whose definition it
+never loaded.
+
+- `mcpproxy_search_tools` searches the tools of the build that is running now.
+  It first restarts the upstream if a rebuild is pending. Queries take the
+  same forms as ToolSearch:
+  - `select:a,b` fetches the named tools.
+  - Plain keywords rank tools by matches in the name, description and
+    parameter names.
+  - `+word` requires `word` in the tool name.
+  - An empty query lists all tools.
+
+  Results are full definitions (name, description, parameter schema) inside
+  `<functions>` blocks. `max_results` defaults to 5.
+- `mcpproxy_call_tool {"name": ..., "arguments": {...}}` calls any upstream
+  tool by name. It goes through the same restart-on-rebuild and schema checks
+  as a direct call.
 
 ### `mcpproxy_restart`
 

@@ -30,6 +30,8 @@ type ServeCmd struct {
 	settle       time.Duration
 	startTimeout time.Duration
 	restartTool  string
+	searchTool   string
+	callTool     string
 	name         string
 	debug        bool
 	logFile      string
@@ -62,6 +64,10 @@ func (p *ServeCmd) SetFlags(f *flag.FlagSet) {
 		"Timeout for the upstream to initialize and list its tools")
 	f.StringVar(&p.restartTool, "restart-tool", "mcpproxy_restart",
 		"Name of the built-in restart/status tool (empty disables it)")
+	f.StringVar(&p.searchTool, "search-tool", "mcpproxy_search_tools",
+		"Name of the built-in tool search over the running build (empty disables it)")
+	f.StringVar(&p.callTool, "call-tool", "mcpproxy_call_tool",
+		"Name of the built-in tool that calls an upstream tool by name (empty disables it)")
 	f.StringVar(
 		&p.name,
 		"name",
@@ -138,7 +144,12 @@ func (p *ServeCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subco
 	}
 	defer func() { _ = up.Close() }()
 
-	mcptool.Register(s, up, p.restartTool)
+	mcptool.Register(s, up, mcptool.Options{
+		RestartTool: p.restartTool,
+		SearchTool:  p.searchTool,
+		CallTool:    p.callTool,
+		ServerName:  filepath.Base(command),
+	})
 
 	if p.poll > 0 {
 		go up.Watch(ctx, p.poll)
