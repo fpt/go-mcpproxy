@@ -20,10 +20,10 @@ restarts it when its executable changes, so that an MCP server under
 development can be rebuilt without restarting the AI agent.
 
 - **mcpproxy/main.go**: Entry point using Google's subcommands pattern
-- **internal/subcmd/**: `serve` (run the proxy) and `check` (test the allowlist)
+- **internal/subcmd/**: `serve` (run the proxy); `add`/`rm`/`ls`/`check` (manage and test the allowlist); `help` comes from `subcommands.HelpCommand`
 - **internal/mcptool/**: Mirrors upstream tools onto the mcp-go server (`SetTools` → `tools/list_changed`) and adds the `mcpproxy_restart` tool
 - **internal/app/**: `Upstream` supervisor. Handles change detection (`fingerprint.go`), restart/launch/crash handling (`upstream.go`), argument validation against the running build's input schemas (`validate.go`), and the stderr tail buffer (`tailbuf.go`)
-- **internal/allowlist/**: Allowlist of executables, loaded from the user-level config (`~/.config/mcpproxy/config.json` or `$MCPPROXY_CONFIG`)
+- **internal/allowlist/**: Allowlist matching (`allowlist.go`) and config editing (`config.go`, atomic save). Loaded from the user-level config (`~/.config/mcpproxy/config.json` or `$MCPPROXY_CONFIG`)
 - **internal/apptest/**: Test helper that builds `internal/app/testdata/echoserver` with `-ldflags -X main.variant=...` to simulate rebuilds
 
 ### Key Behaviors

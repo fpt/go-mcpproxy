@@ -5,7 +5,6 @@
 package allowlist
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -53,16 +52,9 @@ func DefaultPath() (string, error) {
 // Load reads the config file at path. A missing file yields an empty
 // allowlist, which rejects everything.
 func Load(path string) (*Allowlist, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // path comes from the user's own environment
-	if errors.Is(err, os.ErrNotExist) {
-		return New(nil)
-	}
+	cfg, err := LoadConfig(path)
 	if err != nil {
-		return nil, fmt.Errorf("read allowlist config: %w", err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse allowlist config %s: %w", path, err)
+		return nil, err
 	}
 	return New(cfg.Allow)
 }

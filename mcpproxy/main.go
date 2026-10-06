@@ -10,11 +10,14 @@ import (
 )
 
 func main() {
-	subcommands.Register(subcommands.HelpCommand(), "")
-	subcommands.Register(subcommands.FlagsCommand(), "")
-	subcommands.Register(subcommands.CommandsCommand(), "")
-	subcommands.Register(&subcmd.ServeCmd{}, "")
-	subcommands.Register(&subcmd.CheckCmd{}, "")
+	subcommands.Register(subcommands.HelpCommand(), "help")
+	subcommands.Register(subcommands.FlagsCommand(), "help")
+	subcommands.Register(subcommands.CommandsCommand(), "help")
+	subcommands.Register(&subcmd.ServeCmd{}, "proxy")
+	subcommands.Register(&subcmd.AddCmd{}, "allowlist")
+	subcommands.Register(&subcmd.RmCmd{}, "allowlist")
+	subcommands.Register(&subcmd.LsCmd{}, "allowlist")
+	subcommands.Register(&subcmd.CheckCmd{}, "allowlist")
 
 	flag.Parse()
 	ctx := context.Background()

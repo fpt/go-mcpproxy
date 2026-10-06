@@ -41,16 +41,31 @@ make install   # go install ./mcpproxy
 
 ## Allowlist
 
-Create `~/.config/mcpproxy/config.json`. mcpproxy uses
+mcpproxy only launches executables that are in its allowlist. Manage it with:
+
+```bash
+mcpproxy add ./output/my-mcp-server            # relative paths are stored as absolute
+mcpproxy add my-installed-server               # bare names are looked up in PATH
+mcpproxy add '~/src/*/output/*'                # wildcards (quote them)
+mcpproxy add '~/src/experiments/**'            # anything below a directory
+mcpproxy ls                                    # list entries (-v: config path, missing files)
+mcpproxy rm ./output/my-mcp-server             # remove an entry
+mcpproxy check ./output/my-mcp-server          # would this command be allowed?
+mcpproxy help                                  # all subcommands; `mcpproxy help <cmd>` for details
+```
+
+You can add an executable before it has been built. `add` and `rm` accept
+several arguments; if any argument fails, the config is left unchanged.
+
+The allowlist is stored in `~/.config/mcpproxy/config.json`. mcpproxy uses
 `$XDG_CONFIG_HOME/mcpproxy/config.json` if that is set, or the path in
-`$MCPPROXY_CONFIG`.
+`$MCPPROXY_CONFIG`. The file can also be edited by hand:
 
 ```json
 {
   "allow": [
-    "~/src/my-mcp-server/output/my-mcp-server",
-    "~/src/*/output/*",
-    "~/src/experiments/**"
+    "/Users/me/src/my-mcp-server/output/my-mcp-server",
+    "~/src/*/output/*"
   ]
 }
 ```
@@ -63,12 +78,6 @@ Create `~/.config/mcpproxy/config.json`. mcpproxy uses
 - A missing config file allows nothing.
 - Avoid allowing interpreters such as `node` or `python`. Allowing an
   interpreter lets the proxy run any script.
-
-Check a command:
-
-```bash
-mcpproxy check ~/src/my-mcp-server/output/my-mcp-server
-```
 
 ## Usage
 
