@@ -19,10 +19,9 @@ import (
 func newUpstream(t *testing.T, bin string) *app.Upstream {
 	t.Helper()
 	u, err := app.New(app.Options{
-		Command:      bin,
+		Dialer:       apptest.StdioDialer(t, bin),
 		Settle:       50 * time.Millisecond,
 		StartTimeout: 10 * time.Second,
-		Resolve:      func(c string) (string, error) { return filepath.EvalSymlinks(c) },
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = u.Close() })
@@ -65,7 +64,7 @@ func TestUpstreamRestartsOnRebuild(t *testing.T) {
 	// A call shaped for v1 is rejected by the proxy with v2's schema.
 	res = call(t, u, "echo", map[string]any{"message": "hi"})
 	require.True(t, res.IsError)
-	assert.Contains(t, text(res), "do not match the input schema")
+	assert.Contains(t, text(res), "do not match the tool's current input schema")
 	assert.Contains(t, text(res), `"text"`)
 	assert.Equal(t, 2, u.Status().Generation)
 

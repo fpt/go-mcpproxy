@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/fpt/go-mcpproxy/internal/app"
 )
 
 // BuildEchoServer compiles the echoserver fixture with the given variant to
@@ -25,4 +27,14 @@ func BuildEchoServer(t *testing.T, out, variant string) {
 	if err := os.Rename(tmp, out); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// StdioDialer returns a dialer for bin that allows any executable.
+func StdioDialer(t *testing.T, bin string) *app.StdioDialer {
+	t.Helper()
+	d, err := app.NewStdioDialer(bin, nil, nil, filepath.EvalSymlinks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
 }

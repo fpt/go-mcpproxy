@@ -109,7 +109,7 @@ func restartHandler(u *app.Upstream) server.ToolHandlerFunc {
 
 func formatStatus(st app.Status) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "command: %s %s\n", st.Command, strings.Join(st.Args, " "))
+	fmt.Fprintf(&b, "upstream: %s\n", st.Target)
 	if st.Running {
 		fmt.Fprintf(&b, "status: running (generation %d, started %s)\n",
 			st.Generation, st.StartedAt.Format(time.RFC3339))

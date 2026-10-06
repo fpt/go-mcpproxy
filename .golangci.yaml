@@ -29,6 +29,11 @@ linters:
         linters:
           - goconst
           - dupl
+      # Test-only fake OAuth/MCP server.
+      - path: internal/authtest/
+        linters:
+          - goconst
+          - gosec
     paths:
       - third_party$
       - builtin$

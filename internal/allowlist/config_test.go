@@ -58,6 +58,9 @@ func TestCanonicalEntry(t *testing.T) {
 		{"bad pattern", "/opt/[", "", true},
 		{"unknown bare name", "no-such-command-mcpproxy", "", true},
 		{"empty", " ", "", true},
+		{"url", "https://MCP.example.com/mcp/?q=1", "https://mcp.example.com/mcp", false},
+		{"url prefix", "https://mcp.example.com/*", "https://mcp.example.com/*", false},
+		{"bad url", "https://", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

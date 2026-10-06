@@ -7,12 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/fpt/go-mcpproxy/internal/allowlist"
 	"github.com/fpt/go-mcpproxy/internal/app"
 	"github.com/fpt/go-mcpproxy/internal/mcptool"
 	"github.com/google/subcommands"
@@ -24,8 +22,8 @@ const Version = "0.1.0"
 
 // ServeCmd runs mcpproxy as a stdio MCP server in front of an upstream server.
 type ServeCmd struct {
+	target       targetFlags
 	watch        stringList
-	env          stringList
 	poll         time.Duration
 	settle       time.Duration
 	startTimeout time.Duration
@@ -40,18 +38,23 @@ type ServeCmd struct {
 func (*ServeCmd) Name() string     { return "serve" }
 func (*ServeCmd) Synopsis() string { return "Proxy an MCP server, restarting it on rebuild." }
 func (*ServeCmd) Usage() string {
-	return `serve [flags] -- <command> [args...]:
-  Run <command> as an upstream stdio MCP server and proxy its tools.
-  The upstream is restarted when its executable (or a -watch file) changes.
-  <command> must match the allowlist in the mcpproxy config file
-  ($MCPPROXY_CONFIG, or ~/.config/mcpproxy/config.json).
+	return `serve [flags] -- <command> [args...]
+serve [flags] <url>:
+  Proxy the tools of an upstream MCP server over stdio.
+
+  With <command>, the upstream is a local stdio server; it is restarted when
+  its executable (or a -watch file) changes. With <url>, the upstream is a
+  streamable HTTP or SSE server; credentials stored by "mcpproxy auth" are
+  used, and it is reconnected when the connection or authorization fails.
+
+  The target must be in the allowlist (see "mcpproxy add").
 
 `
 }
 
 func (p *ServeCmd) SetFlags(f *flag.FlagSet) {
 	f.Var(&p.watch, "watch", "Extra file to watch for changes (repeatable)")
-	f.Var(&p.env, "env", "KEY=VALUE added to the upstream environment (repeatable)")
+	p.target.setFlags(f)
 	f.DurationVar(
 		&p.poll,
 		"poll",
@@ -84,7 +87,7 @@ func (p *ServeCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subco
 		f.PrintDefaults()
 		return subcommands.ExitUsageError
 	}
-	command, args := f.Arg(0), f.Args()[1:]
+	spec := f.Args()
 
 	logger, closeLog, err := p.setupLogger()
 	if err != nil {
@@ -94,26 +97,24 @@ func (p *ServeCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subco
 	defer closeLog()
 	slog.SetDefault(logger)
 
-	allow, cfgPath, err := loadAllowlist()
+	env, err := loadEnvironment()
 	if err != nil {
-		logger.Error("load allowlist", "error", err)
+		logger.Error("load config", "error", err)
 		return subcommands.ExitFailure
 	}
-	// Reject a disallowed command up front instead of serving an empty proxy.
-	if _, err := allow.Resolve(command); err != nil {
-		logger.Error("upstream command rejected", "error", err, "config", cfgPath)
+	// Reject a disallowed target up front instead of serving an empty proxy.
+	dialer, err := p.target.dialer(env, spec)
+	if err != nil {
+		logger.Error("invalid upstream", "error", err)
 		return subcommands.ExitFailure
 	}
 
 	up, err := app.New(app.Options{
-		Command:       command,
-		Args:          args,
-		Env:           p.env,
+		Dialer:        dialer,
 		Watch:         p.watch,
 		Settle:        p.settle,
 		StartTimeout:  p.startTimeout,
 		Stderr:        os.Stderr,
-		Resolve:       allow.Resolve,
 		ClientName:    "mcpproxy",
 		ClientVersion: Version,
 		Logger:        logger,
@@ -125,7 +126,7 @@ func (p *ServeCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subco
 
 	name := p.name
 	if name == "" {
-		name = "mcpproxy:" + filepath.Base(command)
+		name = "mcpproxy:" + targetName(spec)
 	}
 	opts := []server.ServerOption{server.WithToolCapabilities(true), server.WithRecovery()}
 	if p.debug {
@@ -148,7 +149,7 @@ func (p *ServeCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subco
 		RestartTool: p.restartTool,
 		SearchTool:  p.searchTool,
 		CallTool:    p.callTool,
-		ServerName:  filepath.Base(command),
+		ServerName:  targetName(spec),
 	})
 
 	if p.poll > 0 {
@@ -177,15 +178,6 @@ func (p *ServeCmd) setupLogger() (*slog.Logger, func(), error) {
 		return nil, nil, fmt.Errorf("open log file: %w", err)
 	}
 	return slog.New(slog.NewTextHandler(f, opts)), func() { _ = f.Close() }, nil
-}
-
-func loadAllowlist() (*allowlist.Allowlist, string, error) {
-	path, err := allowlist.DefaultPath()
-	if err != nil {
-		return nil, "", err
-	}
-	a, err := allowlist.Load(path)
-	return a, path, err
 }
 
 // stringList is a repeatable string flag.

@@ -42,9 +42,8 @@ func newProxy(t *testing.T) *proxy {
 	apptest.BuildEchoServer(t, p.bin, "v1")
 
 	up, err := app.New(app.Options{
-		Command: p.bin,
-		Settle:  50 * time.Millisecond,
-		Resolve: func(c string) (string, error) { return filepath.EvalSymlinks(c) },
+		Dialer: apptest.StdioDialer(t, p.bin),
+		Settle: 50 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = up.Close() })

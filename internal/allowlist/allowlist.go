@@ -11,25 +11,32 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/fpt/go-mcpproxy/internal/remote"
 )
 
 // EnvConfigPath overrides the default config file location.
 const EnvConfigPath = "MCPPROXY_CONFIG"
 
-// ErrNotAllowed is returned when an executable does not match any allowlist entry.
-var ErrNotAllowed = errors.New("executable is not in the mcpproxy allowlist")
+// ErrNotAllowed is returned when an executable or URL does not match any
+// allowlist entry.
+var ErrNotAllowed = errors.New("not in the mcpproxy allowlist")
 
 // Config is the on-disk configuration format.
 type Config struct {
-	// Allow lists executable path patterns. Each entry is an absolute path
-	// (a leading "~/" is expanded) that may contain filepath.Match wildcards.
-	// A trailing "/**" matches any file below that directory.
+	// Allow lists executable path patterns and server URLs.
+	//
+	// A path entry is absolute (a leading "~/" is expanded) and may contain
+	// filepath.Match wildcards; a trailing "/**" matches any file below that
+	// directory. A URL entry (http:// or https://) matches that exact URL,
+	// ignoring query and fragment; a trailing "*" makes it a prefix match.
 	Allow []string `json:"allow"`
 }
 
 // Allowlist matches executables against configured patterns.
 type Allowlist struct {
 	patterns []string
+	urls     []string
 }
 
 // DefaultPath returns the config file path: $MCPPROXY_CONFIG if set,
@@ -63,6 +70,14 @@ func Load(path string) (*Allowlist, error) {
 func New(patterns []string) (*Allowlist, error) {
 	a := &Allowlist{}
 	for _, p := range patterns {
+		if remote.IsURL(strings.TrimSpace(p)) {
+			norm, err := normalizeURLPattern(p)
+			if err != nil {
+				return nil, err
+			}
+			a.urls = append(a.urls, norm)
+			continue
+		}
 		norm, err := normalizePattern(p)
 		if err != nil {
 			return nil, err
@@ -72,9 +87,57 @@ func New(patterns []string) (*Allowlist, error) {
 	return a, nil
 }
 
-// Patterns returns the normalized patterns.
+// Patterns returns the normalized path patterns followed by URL patterns.
 func (a *Allowlist) Patterns() []string {
-	return append([]string(nil), a.patterns...)
+	return append(append([]string(nil), a.patterns...), a.urls...)
+}
+
+// CheckURL returns an error wrapping ErrNotAllowed unless serverURL matches
+// a URL entry.
+func (a *Allowlist) CheckURL(serverURL string) error {
+	target, err := normalizeURL(serverURL)
+	if err != nil {
+		return err
+	}
+	for _, p := range a.urls {
+		if prefix, ok := strings.CutSuffix(p, "*"); ok {
+			if strings.HasPrefix(target, prefix) {
+				return nil
+			}
+		} else if target == p {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrNotAllowed, target)
+}
+
+// normalizeURL lowercases scheme and host and drops query, fragment and a
+// trailing slash, so that equivalent spellings compare equal.
+func normalizeURL(s string) (string, error) {
+	u, err := remote.ParseURL(strings.TrimSpace(s))
+	if err != nil {
+		return "", err
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.RawQuery, u.Fragment, u.User = "", "", nil
+	return strings.TrimSuffix(u.String(), "/"), nil
+}
+
+func normalizeURLPattern(p string) (string, error) {
+	p = strings.TrimSpace(p)
+	base, wildcard := strings.CutSuffix(p, "*")
+	norm, err := normalizeURL(base)
+	if err != nil {
+		return "", fmt.Errorf("allowlist entry %q: %w", p, err)
+	}
+	if wildcard {
+		if strings.HasSuffix(base, "/") {
+			norm += "/"
+		}
+		return norm + "*", nil
+	}
+	return norm, nil
 }
 
 // Resolve locates command (via PATH if it has no separator), resolves it to

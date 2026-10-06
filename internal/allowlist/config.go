@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/fpt/go-mcpproxy/internal/remote"
 )
 
 // LoadConfig reads the config file at path. A missing file yields an empty
@@ -87,6 +89,12 @@ func (c *Config) index(entry string) int {
 }
 
 func comparable(entry string) string {
+	if remote.IsURL(entry) {
+		if norm, err := normalizeURLPattern(entry); err == nil {
+			return norm
+		}
+		return entry
+	}
 	p, err := expandHome(entry)
 	if err != nil {
 		return entry
@@ -98,7 +106,12 @@ func comparable(entry string) string {
 // pattern) stored in the config: "~/" is expanded, relative paths are made
 // absolute, and a bare command name is located via PATH. Symlinks are kept
 // as given; they are resolved when the allowlist is loaded.
+//
+// An http(s) URL is stored normalized (see Allowlist.CheckURL).
 func CanonicalEntry(arg string) (string, error) {
+	if remote.IsURL(strings.TrimSpace(arg)) {
+		return normalizeURLPattern(arg)
+	}
 	p, err := expandHome(strings.TrimSpace(arg))
 	if err != nil {
 		return "", err
@@ -126,6 +139,11 @@ func CanonicalEntry(arg string) (string, error) {
 // IsPattern reports whether entry contains wildcards.
 func IsPattern(entry string) bool {
 	return hasMeta(entry)
+}
+
+// IsURL reports whether entry is a server URL rather than a path.
+func IsURL(entry string) bool {
+	return remote.IsURL(entry)
 }
 
 func hasMeta(p string) bool {

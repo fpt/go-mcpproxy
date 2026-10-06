@@ -9,15 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/fpt/go-mcpproxy/internal/remote"
 	"github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -33,24 +32,18 @@ var ErrNotRunning = errors.New("upstream server is not running")
 
 // Options configures an Upstream.
 type Options struct {
-	// Command is the upstream executable, as given on the command line.
-	Command string
-	// Args are passed to the upstream executable.
-	Args []string
-	// Env is appended to the proxy's own environment.
-	Env []string
+	// Dialer connects to the upstream.
+	Dialer Dialer
 	// Watch lists extra files whose modification triggers a restart, e.g. a
-	// script run by an interpreter. The executable itself is always watched.
+	// script run by an interpreter. The dialer's WatchPaths (the executable
+	// of a stdio upstream) are always watched.
 	Watch []string
 	// Settle is how long watched files must stay unchanged before a restart.
 	Settle time.Duration
 	// StartTimeout bounds initialize + tools/list on the new process.
 	StartTimeout time.Duration
-	// Stderr receives the upstream's stderr stream. Defaults to io.Discard.
+	// Stderr receives a stdio upstream's stderr stream. Defaults to io.Discard.
 	Stderr io.Writer
-	// Resolve maps Command to the path to execute, enforcing the allowlist.
-	// It runs before every (re)start so a retargeted symlink is re-checked.
-	Resolve func(command string) (string, error)
 	// ClientName and ClientVersion identify the proxy to the upstream.
 	ClientName    string
 	ClientVersion string
@@ -59,8 +52,7 @@ type Options struct {
 
 // Status describes the current upstream state.
 type Status struct {
-	Command    string
-	Args       []string
+	Target     string
 	Running    bool
 	Generation int
 	StartedAt  time.Time
@@ -96,11 +88,8 @@ type Upstream struct {
 
 // New creates an Upstream. It does not start the process; call Start.
 func New(opts Options) (*Upstream, error) {
-	if opts.Command == "" {
-		return nil, errors.New("upstream command is required")
-	}
-	if opts.Resolve == nil {
-		return nil, errors.New("upstream resolver is required")
+	if opts.Dialer == nil {
+		return nil, errors.New("upstream dialer is required")
 	}
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
@@ -115,11 +104,7 @@ func New(opts Options) (*Upstream, error) {
 		opts.ClientName = "mcpproxy"
 	}
 
-	exe, err := watchPathForCommand(opts.Command)
-	if err != nil {
-		return nil, err
-	}
-	watch := []string{exe}
+	watch := slices.Clone(opts.Dialer.WatchPaths())
 	for _, w := range opts.Watch {
 		abs, err := filepath.Abs(w)
 		if err != nil {
@@ -134,20 +119,6 @@ func New(opts Options) (*Upstream, error) {
 		tail:   newTailBuffer(stderrTailBytes),
 		logger: opts.Logger,
 	}, nil
-}
-
-// watchPathForCommand returns the absolute path to stat for change
-// detection. Symlinks are deliberately not resolved here so that a
-// retargeted symlink is noticed (os.Stat follows it).
-func watchPathForCommand(command string) (string, error) {
-	if strings.ContainsRune(command, filepath.Separator) {
-		return filepath.Abs(command)
-	}
-	p, err := exec.LookPath(command)
-	if err != nil {
-		return "", fmt.Errorf("locate %q: %w", command, err)
-	}
-	return filepath.Abs(p)
 }
 
 // OnToolsChanged registers fn to be called with the new tool list whenever
@@ -205,8 +176,7 @@ func (u *Upstream) Status() Status {
 	u.mu.RLock()
 	defer u.mu.RUnlock()
 	st := Status{
-		Command:    u.opts.Command,
-		Args:       u.opts.Args,
+		Target:     u.opts.Dialer.String(),
 		Running:    u.client != nil,
 		Generation: u.gen,
 		StartedAt:  u.startedAt,
@@ -237,7 +207,12 @@ func (u *Upstream) Watch(ctx context.Context, interval time.Duration) {
 		if !u.changed() {
 			continue
 		}
-		u.logger.InfoContext(ctx, "upstream changed on disk, restarting", "command", u.opts.Command)
+		u.logger.InfoContext(
+			ctx,
+			"upstream changed on disk, restarting",
+			"target",
+			u.opts.Dialer.String(),
+		)
 		if err := u.restart(ctx, false); err != nil {
 			u.logger.WarnContext(ctx, "upstream restart failed", "error", err)
 		}
@@ -272,15 +247,10 @@ func (u *Upstream) restart(ctx context.Context, force bool) error {
 
 	fp := waitSettled(ctx, u.watch, u.opts.Settle, maxSettleWait)
 
-	path, err := u.opts.Resolve(u.opts.Command)
-	if err != nil {
-		u.fail(fp, err)
-		return err
-	}
-
 	u.tail.Reset()
-	c, tools, err := u.launch(ctx, path)
+	c, tools, err := u.launch(ctx)
 	if err != nil {
+		err = u.explain(err)
 		if tail := u.tail.String(); tail != "" {
 			err = fmt.Errorf("%w\n\nupstream stderr:\n%s", err, tail)
 		}
@@ -311,16 +281,8 @@ func (u *Upstream) restart(ctx context.Context, force bool) error {
 	gen := u.gen
 	u.mu.Unlock()
 
-	u.logger.InfoContext(
-		ctx,
-		"upstream started",
-		"path",
-		path,
-		"generation",
-		gen,
-		"tools",
-		len(tools),
-	)
+	u.logger.InfoContext(ctx, "upstream started",
+		"target", u.opts.Dialer.String(), "generation", gen, "tools", len(tools))
 	if old != nil {
 		go closeQuietly(old)
 	}
@@ -345,16 +307,15 @@ func (u *Upstream) fail(fp fingerprint, err error) {
 	}
 }
 
-func (u *Upstream) launch(ctx context.Context, path string) (*client.Client, []mcp.Tool, error) {
-	stderr := io.MultiWriter(u.opts.Stderr, u.tail)
-	c, err := client.NewStdioMCPClientWithOptions(path, u.opts.Env, u.opts.Args,
-		transport.WithCommandStderrWriter(stderr))
-	if err != nil {
-		return nil, nil, fmt.Errorf("start %s: %w", path, err)
-	}
-
+func (u *Upstream) launch(ctx context.Context) (*client.Client, []mcp.Tool, error) {
 	ctx, cancel := context.WithTimeout(ctx, u.opts.StartTimeout)
 	defer cancel()
+
+	target := u.opts.Dialer.String()
+	c, err := u.opts.Dialer.Dial(ctx, io.MultiWriter(u.opts.Stderr, u.tail))
+	if err != nil {
+		return nil, nil, err
+	}
 
 	_, err = c.Initialize(ctx, mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
@@ -367,12 +328,12 @@ func (u *Upstream) launch(ctx context.Context, path string) (*client.Client, []m
 	})
 	if err != nil {
 		closeQuietly(c)
-		return nil, nil, fmt.Errorf("initialize %s: %w", path, err)
+		return nil, nil, fmt.Errorf("initialize %s: %w", target, err)
 	}
 	res, err := c.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
 		closeQuietly(c)
-		return nil, nil, fmt.Errorf("list tools of %s: %w", path, err)
+		return nil, nil, fmt.Errorf("list tools of %s: %w", target, err)
 	}
 
 	c.OnNotification(func(n mcp.JSONRPCNotification) {
@@ -386,6 +347,13 @@ func (u *Upstream) launch(ctx context.Context, path string) (*client.Client, []m
 // reloadTools refreshes the tool list after the upstream itself announced
 // a change, without restarting the process.
 func (u *Upstream) reloadTools(c *client.Client) {
+	if err := u.relist(context.Background(), c); err != nil {
+		u.logger.Warn("reload tools after list_changed failed", "error", err)
+	}
+}
+
+// relist re-fetches the tool list from c if it is still the current client.
+func (u *Upstream) relist(ctx context.Context, c *client.Client) error {
 	u.restartMu.Lock()
 	defer u.restartMu.Unlock()
 
@@ -393,15 +361,14 @@ func (u *Upstream) reloadTools(c *client.Client) {
 	current := u.client
 	u.mu.RUnlock()
 	if current != c {
-		return
+		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), u.opts.StartTimeout)
+	ctx, cancel := context.WithTimeout(ctx, u.opts.StartTimeout)
 	defer cancel()
 	res, err := c.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
-		u.logger.Warn("reload tools after list_changed failed", "error", err)
-		return
+		return err
 	}
 	schemas := make(map[string]*jsonschema.Schema, len(res.Tools))
 	for _, t := range res.Tools {
@@ -416,6 +383,7 @@ func (u *Upstream) reloadTools(c *client.Client) {
 	if changed && u.onToolsChanged != nil {
 		u.onToolsChanged(slices.Clone(res.Tools))
 	}
+	return nil
 }
 
 // CallTool forwards a tool call to the upstream. Before forwarding it
@@ -430,10 +398,52 @@ func (u *Upstream) CallTool(
 ) (*mcp.CallToolResult, error) {
 	if err := u.Refresh(ctx); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf(
-			"mcpproxy: upstream %s could not be (re)started: %v", u.opts.Command, err,
+			"mcpproxy: upstream %s could not be (re)started: %v", u.opts.Dialer.String(), err,
 		)), nil
 	}
 
+	c, rejected := u.check(req)
+	if rejected != nil && c != nil {
+		// The cached tool list may be outdated, e.g. a remote server that
+		// reloaded itself. Re-list once before rejecting; this costs nothing
+		// on the happy path.
+		if err := u.relist(ctx, c); err == nil {
+			c, rejected = u.check(req)
+		}
+	}
+	if rejected != nil {
+		return rejected, nil
+	}
+
+	name := req.Params.Name
+	res, err := c.CallTool(ctx, req)
+	if err == nil {
+		return res, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if remote.IsAuthError(err) {
+		// Drop the connection so the next call reconnects with whatever
+		// credentials "mcpproxy auth" has stored in the meantime.
+		u.markCrashed(c, err)
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"mcpproxy: call to upstream tool %q failed: %v", name, u.explain(err),
+		)), nil
+	}
+	msg := fmt.Sprintf("mcpproxy: call to upstream tool %q failed: %v", name, err)
+	if !u.alive(c) {
+		u.markCrashed(c, err)
+		if tail := u.tail.String(); tail != "" {
+			msg += "\n\nThe upstream process appears to have exited. Recent stderr:\n" + tail
+		}
+	}
+	return mcp.NewToolResultError(msg), nil
+}
+
+// check returns the current client and, if the call cannot be forwarded, the
+// error result explaining why.
+func (u *Upstream) check(req mcp.CallToolRequest) (*client.Client, *mcp.CallToolResult) {
 	name := req.Params.Name
 	u.mu.RLock()
 	c := u.client
@@ -447,35 +457,29 @@ func (u *Upstream) CallTool(
 		if lastErr == nil {
 			lastErr = ErrNotRunning
 		}
-		return mcp.NewToolResultError(fmt.Sprintf("mcpproxy: %v", lastErr)), nil
+		return nil, mcp.NewToolResultError(fmt.Sprintf("mcpproxy: %v", lastErr))
 	}
 	if !found {
-		return mcp.NewToolResultError(fmt.Sprintf(
-			"mcpproxy: tool %q does not exist in the current build of the upstream server. "+
-				"Available tools: %s", name, strings.Join(names, ", "),
-		)), nil
+		return c, mcp.NewToolResultError(fmt.Sprintf(
+			"mcpproxy: tool %q does not exist on the upstream server (its tools may have "+
+				"changed since you listed them). Available tools: %s",
+			name, strings.Join(names, ", "),
+		))
 	}
 	if schema != nil {
 		if err := validateArguments(schema, req); err != nil {
-			return invalidArgumentsResult(tool, err), nil
+			return c, invalidArgumentsResult(tool, err)
 		}
 	}
+	return c, nil
+}
 
-	res, err := c.CallTool(ctx, req)
-	if err == nil {
-		return res, nil
+// explain appends a hint on how to authorize to authorization errors.
+func (u *Upstream) explain(err error) error {
+	if hint := u.opts.Dialer.AuthHint(); hint != "" && remote.IsAuthError(err) {
+		return fmt.Errorf("%w\n\n%s", err, hint)
 	}
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	msg := fmt.Sprintf("mcpproxy: call to upstream tool %q failed: %v", name, err)
-	if !u.alive(c) {
-		u.markCrashed(c, err)
-		if tail := u.tail.String(); tail != "" {
-			msg += "\n\nThe upstream process appears to have exited. Recent stderr:\n" + tail
-		}
-	}
-	return mcp.NewToolResultError(msg), nil
+	return err
 }
 
 func (u *Upstream) alive(c *client.Client) bool {
@@ -506,8 +510,8 @@ func invalidArgumentsResult(tool mcp.Tool, err error) *mcp.CallToolResult {
 		pretty.Write(schema)
 	}
 	return mcp.NewToolResultError(fmt.Sprintf(
-		"mcpproxy: arguments for %q do not match the input schema of the currently running build "+
-			"(the tool may have changed since you last listed it): %v\n\nCurrent input schema:\n%s",
+		"mcpproxy: arguments for %q do not match the tool's current input schema "+
+			"(it may have changed since you listed it): %v\n\nCurrent input schema:\n%s",
 		tool.Name, err, pretty.String(),
 	))
 }

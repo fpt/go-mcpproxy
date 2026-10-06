@@ -15,14 +15,16 @@ import (
 type AddCmd struct{}
 
 func (*AddCmd) Name() string     { return "add" }
-func (*AddCmd) Synopsis() string { return "Allow an executable to be proxied." }
+func (*AddCmd) Synopsis() string { return "Allow an executable or server URL to be proxied." }
 func (*AddCmd) Usage() string {
-	return `add <executable>...:
-  Add executables to the allowlist. Paths are stored as absolute paths; a bare
+	return `add <executable|url>...:
+  Add executables or server URLs to the allowlist. Paths are stored as absolute paths; a bare
   name is looked up in PATH. Wildcards are allowed (quote them), and a trailing
   "/**" allows everything below a directory, e.g.
     mcpproxy add ./output/my-server
     mcpproxy add '~/src/my-server/output/*'
+    mcpproxy add https://mcp.example.com/mcp
+    mcpproxy add 'https://mcp.example.com/*'
 `
 }
 
@@ -34,7 +36,7 @@ func (*AddCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands
 		return subcommands.ExitUsageError
 	}
 	return editConfig(f.Args(), func(cfg *allowlist.Config, entry string) error {
-		if !allowlist.IsPattern(entry) {
+		if !allowlist.IsPattern(entry) && !allowlist.IsURL(entry) {
 			if _, err := os.Stat(entry); errors.Is(err, os.ErrNotExist) {
 				fmt.Fprintf(os.Stderr, "note: %s does not exist yet\n", entry)
 			}
@@ -52,9 +54,9 @@ func (*AddCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands
 type RmCmd struct{}
 
 func (*RmCmd) Name() string     { return "rm" }
-func (*RmCmd) Synopsis() string { return "Remove an executable from the allowlist." }
+func (*RmCmd) Synopsis() string { return "Remove an executable or server URL from the allowlist." }
 func (*RmCmd) Usage() string {
-	return `rm <executable>...:
+	return `rm <executable|url>...:
   Remove entries from the allowlist. Give the path or pattern as shown by
   "mcpproxy ls" (relative paths and "~/" are expanded the same way as "add").
 `
@@ -115,7 +117,7 @@ type LsCmd struct {
 }
 
 func (*LsCmd) Name() string     { return "ls" }
-func (*LsCmd) Synopsis() string { return "List allowed executables." }
+func (*LsCmd) Synopsis() string { return "List allowed executables and server URLs." }
 func (*LsCmd) Usage() string {
 	return `ls [-v]:
   Print the allowlist entries, one per line.
@@ -141,7 +143,7 @@ func (p *LsCmd) Execute(context.Context, *flag.FlagSet, ...any) subcommands.Exit
 		fmt.Printf("# config: %s\n", path)
 	}
 	for _, e := range cfg.Allow {
-		if p.verbose && !allowlist.IsPattern(e) {
+		if p.verbose && !allowlist.IsPattern(e) && !allowlist.IsURL(e) {
 			if _, err := os.Stat(e); err != nil {
 				fmt.Printf("%s\t(missing)\n", e)
 				continue
