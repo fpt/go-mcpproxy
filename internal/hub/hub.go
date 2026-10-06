@@ -61,6 +61,7 @@ type Hub struct {
 	applyMu   sync.Mutex
 	mu        sync.RWMutex
 	backends  map[string]*backend
+	wrappers  map[string]config.Wrapper
 	configErr error
 	onChange  func()
 }
@@ -110,6 +111,13 @@ func (h *Hub) Get(name string) (Backend, bool) {
 	return b.Backend, true
 }
 
+// Wrappers returns the configured wrapper tools.
+func (h *Hub) Wrappers() map[string]config.Wrapper {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return maps.Clone(h.wrappers)
+}
+
 // ConfigError returns the error of the most recent failed config load.
 func (h *Hub) ConfigError() error {
 	h.mu.RLock()
@@ -134,6 +142,8 @@ func (h *Hub) Apply(ctx context.Context, cfg *config.Config) {
 
 	h.mu.Lock()
 	h.configErr = nil
+	wrappersChanged := !maps.EqualFunc(h.wrappers, cfg.Wrapper, config.Wrapper.Equal)
+	h.wrappers = maps.Clone(cfg.Wrapper)
 	var stopped, started []*backend
 	for name, b := range h.backends {
 		if srv, ok := cfg.Servers[name]; !ok || !srv.Equal(b.Server) {
@@ -179,7 +189,7 @@ func (h *Hub) Apply(ctx context.Context, cfg *config.Config) {
 			go b.Upstream.Watch(b.ctx, h.opts.Poll)
 		}
 	}
-	if len(stopped) > 0 || len(started) > 0 {
+	if len(stopped) > 0 || len(started) > 0 || wrappersChanged {
 		h.notify()
 	}
 }
@@ -239,7 +249,8 @@ func (h *Hub) WatchConfig(ctx context.Context, path string, interval time.Durati
 			h.notify()
 			continue
 		}
-		h.opts.Logger.InfoContext(ctx, "config changed, reloading", "servers", cfg.Names())
+		h.opts.Logger.InfoContext(ctx, "config changed, reloading",
+			"servers", cfg.Names(), "wrappers", cfg.WrapperNames())
 		h.Apply(ctx, cfg)
 	}
 }

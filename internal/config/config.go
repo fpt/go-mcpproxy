@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -34,6 +35,51 @@ var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`)
 type Config struct {
 	// Servers maps a server name to how to reach it.
 	Servers map[string]Server `toml:"servers"`
+	// Wrapper maps a tool name to a shell command exposed as a tool.
+	Wrapper map[string]Wrapper `toml:"wrapper,omitempty"`
+}
+
+// ReservedPrefix starts the names of mcpproxy's built-in tools; server and
+// wrapper names may not use it.
+const ReservedPrefix = "mcpproxy"
+
+// Wrapper is a custom tool that runs one fixed shell command and returns its
+// exit code, stdout and stderr. The agent cannot pass arguments to it.
+type Wrapper struct {
+	// Command is run with "sh -c" ("cmd /C" on Windows).
+	Command string `toml:"command"`
+	// Description is shown to the agent; a default names the command.
+	Description string `toml:"description,omitempty"`
+	// Dir is the working directory; "~/" and ${NAME} expand, and a relative
+	// path is relative to mcpproxy's working directory (the default).
+	Dir string `toml:"dir,omitempty"`
+	// Env is added to the environment; values may reference ${NAME}.
+	Env map[string]string `toml:"env,omitempty"`
+	// Timeout kills the command after this long (default 10m).
+	Timeout time.Duration `toml:"timeout,omitzero"`
+	// MaxOutput is the number of bytes kept from the end of stdout and of
+	// stderr each (default 100000).
+	MaxOutput int `toml:"max_output,omitzero"`
+}
+
+// Equal reports whether two wrapper definitions are identical.
+func (w Wrapper) Equal(o Wrapper) bool {
+	return w.Command == o.Command && w.Description == o.Description && w.Dir == o.Dir &&
+		mapsEqual(w.Env, o.Env) && w.Timeout == o.Timeout && w.MaxOutput == o.MaxOutput
+}
+
+// Validate checks a wrapper definition.
+func (w Wrapper) Validate() error {
+	if strings.TrimSpace(w.Command) == "" {
+		return errors.New("command is required")
+	}
+	if w.Timeout < 0 {
+		return errors.New("timeout must not be negative")
+	}
+	if w.MaxOutput < 0 {
+		return errors.New("max_output must not be negative")
+	}
+	return nil
 }
 
 // Server is one backend MCP server: either a local stdio command or a
@@ -124,12 +170,19 @@ func (s Server) Validate() error {
 	return nil
 }
 
-// ValidateName checks a server name. Names become tool name prefixes, so
-// they are restricted to letters, digits, "-" and "_", without "__".
+// ValidateName checks a server or wrapper name. Names become tool names or
+// tool name prefixes, so they are restricted to letters, digits, "-" and "_", without "__".
 func ValidateName(name string) error {
 	if !namePattern.MatchString(name) || strings.Contains(name, ToolSeparator) {
-		return fmt.Errorf("invalid server name %q: use up to 32 letters, digits, '-' or '_' "+
+		return fmt.Errorf("invalid name %q: use up to 32 letters, digits, '-' or '_' "+
 			"(starting with a letter or digit, without %q)", name, ToolSeparator)
+	}
+	if strings.HasPrefix(strings.ToLower(name), ReservedPrefix) {
+		return fmt.Errorf(
+			"invalid name %q: names starting with %q are reserved",
+			name,
+			ReservedPrefix,
+		)
 	}
 	return nil
 }
@@ -144,7 +197,28 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("server %q: %w", name, err)
 		}
 	}
+	for _, name := range c.WrapperNames() {
+		if err := ValidateName(name); err != nil {
+			return err
+		}
+		if _, ok := c.Servers[name]; ok {
+			return fmt.Errorf("%q is defined both as a server and as a wrapper", name)
+		}
+		if err := c.Wrapper[name].Validate(); err != nil {
+			return fmt.Errorf("wrapper %q: %w", name, err)
+		}
+	}
 	return nil
+}
+
+// WrapperNames returns the wrapper names in sorted order.
+func (c *Config) WrapperNames() []string {
+	names := make([]string, 0, len(c.Wrapper))
+	for n := range c.Wrapper {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	return names
 }
 
 // Names returns the server names in sorted order.
@@ -180,7 +254,7 @@ func DefaultPath() (string, error) {
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // path comes from the user's own environment
 	if errors.Is(err, os.ErrNotExist) {
-		return &Config{Servers: map[string]Server{}}, nil
+		return &Config{Servers: map[string]Server{}, Wrapper: map[string]Wrapper{}}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -199,6 +273,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Servers == nil {
 		cfg.Servers = map[string]Server{}
+	}
+	if cfg.Wrapper == nil {
+		cfg.Wrapper = map[string]Wrapper{}
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)

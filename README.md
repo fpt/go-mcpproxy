@@ -14,6 +14,7 @@ make install
 mcpproxy add godev -- ~/src/go-dev-mcp/output/godevmcp serve   # a local stdio server
 mcpproxy add example https://mcp.example.com/mcp               # a remote HTTP/SSE server
 mcpproxy auth example                                          # OAuth in the browser, if needed
+mcpproxy wrap test 'make test'                                 # a custom tool running a shell command
 claude mcp add mcpproxy -- mcpproxy serve
 ```
 
@@ -40,6 +41,10 @@ claude mcp add mcpproxy -- mcpproxy serve
 - **Tool search for rebuilt tools.** `mcpproxy_search_tools` and
   `mcpproxy_call_tool` reach tools that the client's own tool search hasn't
   indexed or holds outdated schemas for.
+- **Wrapper tools.** `[wrapper.<name>]` turns a fixed shell command, such as
+  `make test`, into a tool. The tool returns the exit code, stdout and stderr
+  as separate fields; a non-zero exit is reported as an error. The agent
+  cannot pass arguments to it.
 - **Command-line client.** `mcpproxy tools` and `mcpproxy call` list and call
   tools of any configured server.
 - **The config is the allowlist.** mcpproxy only launches or contacts servers
@@ -61,6 +66,10 @@ env = { LOG_LEVEL = "debug" }                       # optional
 url = "https://mcp.example.com/mcp"
 # transport = "sse"                                 # default: sse if the path ends in /sse
 headers = { Authorization = "Bearer ${EXAMPLE_TOKEN}" }
+
+[wrapper.test]
+command = "make test"                               # runs in the project directory
+timeout = "5m"                                      # optional; also description, dir, env, max_output
 ```
 
 ## Commands
@@ -69,10 +78,11 @@ headers = { Authorization = "Bearer ${EXAMPLE_TOKEN}" }
 | --- | --- |
 | `serve` | Run as a stdio MCP server for every configured server |
 | `add <name> -- <command> [args...]` / `add <name> <url>` | Add or replace a server |
-| `rm <name>...` | Remove servers |
-| `ls [-v]` | List servers |
+| `wrap <name> '<shell command>'` | Add or replace a wrapper tool |
+| `rm <name>...` | Remove servers or wrapper tools |
+| `ls [-v]` | List servers and wrapper tools |
 | `tools [<name>...]` | List tools |
-| `call <name> <tool> [args...]` | Call a tool (`key=value`, `key:=json`, a JSON object, or `-` for stdin) |
+| `call <name> <tool> [args...]` | Call a tool (`key=value`, `key:=json`, a JSON object, or `-` for stdin); `call <wrapper>` runs a wrapper |
 | `auth <name>` / `logout <name>` | Store or delete OAuth credentials for a URL server |
 
 See [doc/USAGE.md](doc/USAGE.md) for the details.

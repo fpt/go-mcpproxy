@@ -290,3 +290,56 @@ func TestServerNotBuiltYetAndBroken(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, res.IsError)
 }
+
+func TestWrapperTools(t *testing.T) {
+	p := newProxy(t, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.hub.WatchConfig(ctx, p.cfgPath, 20*time.Millisecond)
+
+	cfg, err := config.Load(p.cfgPath)
+	require.NoError(t, err)
+	cfg.Wrapper["check"] = config.Wrapper{Command: `echo ok; echo warn >&2; exit 2`}
+	require.NoError(t, cfg.Save(p.cfgPath))
+	waitFor(t, func() bool { return slices.Contains(p.names(t), "check") })
+
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "check"
+	res, err := p.client.CallTool(context.Background(), req)
+	require.NoError(t, err)
+	assert.True(t, res.IsError, "non-zero exit is an error")
+	assert.Equal(t, map[string]any{"exit_code": 2.0, "stdout": "ok\n", "stderr": "warn\n"},
+		res.StructuredContent)
+
+	tools, err := p.client.ListTools(context.Background(), mcp.ListToolsRequest{})
+	require.NoError(t, err)
+	for _, tool := range tools.Tools {
+		if tool.Name == "check" {
+			assert.Contains(t, tool.Description, "Run `echo ok;")
+			assert.NotEmpty(t, tool.OutputSchema.Properties)
+		}
+	}
+
+	out, isErr := p.call(t, mcptool.SearchTool, map[string]any{"query": "select:check"})
+	require.False(t, isErr, out)
+	assert.Contains(t, out, `"name":"check"`)
+
+	out, isErr = p.call(t, mcptool.CallTool, map[string]any{"name": "check"})
+	assert.True(t, isErr)
+	assert.Contains(t, out, `"exit_code": 2`)
+
+	out, _ = p.call(t, mcptool.StatusTool, nil)
+	assert.Contains(t, out, "[check] wrapper tool: echo ok;")
+
+	// Editing the command takes effect without restarting anything.
+	cfg.Wrapper["check"] = config.Wrapper{Command: `echo fixed`}
+	require.NoError(t, cfg.Save(p.cfgPath))
+	waitFor(t, func() bool {
+		res, err := p.client.CallTool(context.Background(), req)
+		return err == nil && !res.IsError
+	})
+
+	delete(cfg.Wrapper, "check")
+	require.NoError(t, cfg.Save(p.cfgPath))
+	waitFor(t, func() bool { return !slices.Contains(p.names(t), "check") })
+}

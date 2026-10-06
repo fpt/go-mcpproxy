@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/fpt/go-mcpproxy/internal/app"
 	"github.com/fpt/go-mcpproxy/internal/hub"
+	"github.com/fpt/go-mcpproxy/internal/wrapper"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -70,6 +73,11 @@ func searchHandler(h *hub.Hub) server.ToolHandlerFunc {
 			for _, t := range b.Upstream.Tools() {
 				tools = append(tools, prefixed(b.Name, t))
 			}
+		}
+
+		wrappers := h.Wrappers()
+		for _, name := range slices.Sorted(maps.Keys(wrappers)) {
+			tools = append(tools, wrapper.Tool(name, wrappers[name]))
 		}
 
 		res := app.SearchTools(tools, query, maxResults)
@@ -150,9 +158,12 @@ func callHandler(h *hub.Hub) server.ToolHandlerFunc {
 		}
 		serverName, toolName, ok := splitToolName(name)
 		if !ok {
+			if w, found := h.Wrappers()[name]; found {
+				return wrapper.ToolResult(wrapper.Run(ctx, w)), nil
+			}
 			return mcp.NewToolResultError(fmt.Sprintf(
-				"mcpproxy: %q is not a proxied tool name; use \"<server>__<tool>\" "+
-					"(built-in tools are called directly)", name,
+				"mcpproxy: %q is not a proxied tool name; use \"<server>__<tool>\" or a "+
+					"wrapper tool's name (built-in tools are called directly)", name,
 			)), nil
 		}
 		b, found := h.Get(serverName)

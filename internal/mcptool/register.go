@@ -8,12 +8,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fpt/go-mcpproxy/internal/config"
 	"github.com/fpt/go-mcpproxy/internal/hub"
+	"github.com/fpt/go-mcpproxy/internal/wrapper"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -79,6 +82,13 @@ func serverTools(h *hub.Hub) []server.ServerTool {
 			})
 		}
 	}
+	wrappers := h.Wrappers()
+	for _, name := range slices.Sorted(maps.Keys(wrappers)) {
+		out = append(out, server.ServerTool{
+			Tool:    wrapper.Tool(name, wrappers[name]),
+			Handler: wrapper.Handler(wrappers[name]),
+		})
+	}
 	names := make([]string, 0, len(backends))
 	for _, b := range backends {
 		names = append(names, b.Name)
@@ -132,13 +142,22 @@ func statusHandler(h *hub.Hub) server.ToolHandlerFunc {
 			)
 		}
 		backends := h.Backends()
-		if len(backends) == 0 {
+		wrappers := h.Wrappers()
+		if len(backends) == 0 && len(wrappers) == 0 {
 			b.WriteString("No servers are configured. The user can add one with " +
 				"`mcpproxy add <name> -- <command> [args...]` or `mcpproxy add <name> <url>`.\n")
 		}
 		for _, be := range backends {
 			b.WriteString(formatStatus(be))
 			b.WriteString("\n")
+		}
+		for _, name := range slices.Sorted(maps.Keys(wrappers)) {
+			w := wrappers[name]
+			dir := w.Dir
+			if dir == "" {
+				dir = "(mcpproxy's working directory)"
+			}
+			fmt.Fprintf(&b, "[%s] wrapper tool: %s\ndir: %s\n\n", name, w.Command, dir)
 		}
 		return mcp.NewToolResultText(b.String()), nil
 	}

@@ -7,6 +7,7 @@ the [README](../README.md).
 - [Installation and setup](#installation-and-setup)
 - [Configuration file](#configuration-file)
 - [Managing servers: `add`, `rm`, `ls`](#managing-servers-add-rm-ls)
+- [Wrapper tools: `wrap`](#wrapper-tools-wrap)
 - [Running the proxy: `serve`](#running-the-proxy-serve)
 - [Built-in tools](#built-in-tools)
 - [Authentication: `auth` and `logout`](#authentication-auth-and-logout)
@@ -32,8 +33,12 @@ The agent sees each backend tool as `<name>__<tool>`; for example, the tool
 `search_godoc` of the server `godev` becomes `godev__search_godoc`. mcpproxy
 adds four built-in tools named `mcpproxy_*`.
 
-The config file is the **allowlist**: mcpproxy only launches executables and
-contacts URLs that are listed in it. The file lives in your home directory,
+The config can also define **wrapper tools**. A wrapper is a custom tool that
+runs one fixed shell command, such as `make test`, and returns its exit code,
+stdout and stderr.
+
+The config file is the **allowlist**: mcpproxy only launches executables,
+contacts URLs and runs shell commands that are listed in it. The file lives in your home directory,
 not in a project, so a project's MCP configuration cannot make mcpproxy run
 anything else.
 
@@ -103,11 +108,15 @@ headers = { Authorization = "Bearer ${LEGACY_TOKEN}" }
 | `transport` | URL | `http` (streamable HTTP) or `sse`. Default: `sse` if the URL path ends in `/sse`, otherwise `http` |
 | `headers` | URL | HTTP headers sent with every request |
 
+Wrapper tools are defined under `[wrapper.<name>]`; see
+[Wrapper tools](#wrapper-tools-wrap) for their keys.
+
 Rules:
 
 - **One kind per server.** A server has either `command` or `url`, never both.
 - **Names.** A name has up to 32 characters: letters, digits, `-` and `_`. It
-  must start with a letter or digit and must not contain `__`.
+  must start with a letter or digit, must not contain `__`, and must not
+  start with `mcpproxy`. Servers and wrappers share one namespace.
 - **Environment variables.** Values in `env` and `headers` may reference
   environment variables as `${NAME}`. They are expanded when the server is
   started or connected, so secrets can stay out of the file. A bare `$` is
@@ -173,6 +182,107 @@ example	https://mcp.example.com/mcp	(authorized)
 godev	/Users/me/src/go-dev-mcp/output/godevmcp serve
 ```
 
+## Wrapper tools: `wrap`
+
+A wrapper tool runs one fixed shell command and reports how it went. It lets
+the agent run your project's usual commands, such as tests, linters or a
+build, through MCP. You decide the exact command line; the agent can't pass
+arguments, so it can't run anything else through the tool.
+
+```toml
+[wrapper.test]
+command = "make test"
+
+[wrapper.lint]
+command = "golangci-lint run ./..."
+description = "Run the linters. Fix every reported issue."
+dir = "~/src/app"
+env = { GOFLAGS = "-mod=mod", TOKEN = "${CI_TOKEN}" }
+timeout = "5m"
+max_output = 20000
+```
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `command` (required) | | Shell command, run with `/bin/sh -c` (`cmd /C` on Windows) |
+| `description` | ``Run `<command>` in <dir>.`` | What the agent is told the tool does. A note about the result is always appended |
+| `dir` | mcpproxy's working directory | Working directory. `~/` and `${NAME}` expand; a relative path is relative to mcpproxy's working directory |
+| `env` | | Extra environment variables; values may use `${NAME}` |
+| `timeout` | `10m` | Kill the command after this long. Go duration syntax: `90s`, `5m`, `1h30m` |
+| `max_output` | `100000` | Bytes kept from the **end** of stdout and of stderr each |
+
+**Working directory.** When Claude Code starts mcpproxy, its working
+directory is the project directory. So `command = "make test"` runs the
+current project's tests, as long as mcpproxy is registered per project, which
+is the default scope of `claude mcp add`. Set `dir` to always use one
+directory.
+
+### The tool's result
+
+The tool takes no arguments. Its result has structured content matching a
+declared output schema, and the same JSON as text:
+
+```json
+{
+  "exit_code": 2,
+  "stdout": "ok   pkg/a  0.3s\nFAIL pkg/b ...",
+  "stderr": "make: *** [test] Error 1\n"
+}
+```
+
+- `exit_code` is the command's exit status. It is `-1` when the command did
+  not exit by itself: it was killed by the timeout or a signal, or it could
+  not be started. `error` then says why.
+- `stdout` and `stderr` are captured separately, and only the last
+  `max_output` bytes of each are kept. The end of the output is usually where
+  failures are summarized. When something was dropped, `stdout_truncated` or
+  `stderr_truncated` is `true`.
+- `error` and the `*_truncated` fields appear only when they apply.
+- The result is marked as an error (`isError: true`) whenever `exit_code` is
+  not 0.
+- Stdin is empty.
+- On timeout or cancellation, the whole process group is killed, including
+  children such as compilers started by `make`. Nothing keeps running in the
+  background.
+
+### `mcpproxy wrap [flags] <name> '<shell command>'`
+
+### `mcpproxy wrap [flags] <name> -- <command> [args...]`
+
+Adds a wrapper, or replaces the one with that name.
+
+```bash
+mcpproxy wrap test 'make test'
+mcpproxy wrap -d 'Run the linters' -timeout 5m lint -- golangci-lint run ./...
+mcpproxy wrap -dir ~/src/app build 'npm run build 2>&1 | tail -50'
+```
+
+**Giving the command**
+
+- A single argument is used as the shell command as is, so pipes, `&&` and
+  redirections work. Quote it.
+- After `--`, the words are quoted for the shell and joined.
+  `-- printf '%s|' 'a b'` becomes `printf '%s|' 'a b'`.
+
+| Flag | Description |
+| --- | --- |
+| `-d text` | Description shown to the agent |
+| `-dir path` | Working directory, stored as an absolute path |
+| `-env KEY=VALUE` | Environment variable (repeatable) |
+| `-timeout d` | Timeout (default 10m) |
+| `-max-output n` | Bytes kept from the end of each stream (default 100000) |
+
+`mcpproxy rm <name>` removes a wrapper, and `mcpproxy ls` lists wrappers
+after the servers as `<name>\twrapper: <command>`. A running `mcpproxy serve`
+applies all of these changes immediately.
+
+### Trying a wrapper from the terminal
+
+```bash
+mcpproxy call test          # stdout and stderr pass through; exits with the command's exit code
+mcpproxy call -json test    # prints the result JSON the agent would get
+```
+
 ## Running the proxy: `serve`
 
 ```bash
@@ -212,6 +322,7 @@ once the file is fixed.
 | Server removed | It is stopped, and its tools are removed |
 | Server changed (any key) | It is stopped and started again with the new settings |
 | Server unchanged | Untouched; running calls continue |
+| Wrapper added, changed or removed | The tool list is updated; the next call uses the new definition |
 | File invalid | Nothing changes. `mcpproxy_status` shows the error until the file is valid again |
 
 After each change, the client is sent `notifications/tools/list_changed`.
@@ -265,13 +376,13 @@ resources are not.
 
 ## Built-in tools
 
-Built-in tool names contain no `__`, so they never collide with backend
-tools.
+Built-in tool names start with `mcpproxy_`, which server and wrapper names
+may not use, so they never collide.
 
 ### `mcpproxy_status`
 
 Shows every server, with its kind and target, whether it is running, its
-tools, and its last error or recent stderr. It also shows a config error if
+tools, and its last error or recent stderr. It also lists the wrapper tools. It also shows a config error if
 the file is invalid. Agents should use it when a proxied tool fails or is
 missing.
 
@@ -291,8 +402,8 @@ status. Use it when the server depends on files that aren't watched.
 **Why it exists.** Clients cache tool definitions. Claude Code's ToolSearch,
 for example, only indexes the tools it saw when it connected, so it cannot
 find tools added or changed by a rebuild or a config change. This tool
-searches the tools of all servers as they are now, restarting any server with
-a pending rebuild first.
+searches the tools of all servers and wrappers as they are now, restarting any
+server with a pending rebuild first.
 
 | Parameter | Description |
 | --- | --- |
@@ -327,7 +438,7 @@ running are listed as warnings.
 
 ### `mcpproxy_call_tool {"name": "<server>__<tool>", "arguments": {...}}`
 
-Calls any backend tool by its full name, for tools the client has no
+Calls any backend tool by its full name, or a wrapper tool by its name, for tools the client has no
 definition for or holds an outdated schema for. The call goes through the same
 rebuild check and validation as a direct call.
 
@@ -542,10 +653,11 @@ launches Claude Code.
 | --- | --- |
 | `serve [flags]` | Run the proxy as a stdio MCP server |
 | `add [flags] <name> (-- <command> [args...] \| <url>)` | Add or replace a server |
-| `rm <name>...` | Remove servers |
-| `ls [-v]` | List servers |
+| `wrap [flags] <name> ('<shell command>' \| -- <command> [args...])` | Add or replace a wrapper tool |
+| `rm <name>...` | Remove servers or wrapper tools |
+| `ls [-v]` | List servers and wrapper tools |
 | `tools [flags] [<name>...]` | List tools |
-| `call [flags] <name> <tool> [args...]` | Call a tool |
+| `call [flags] <name> <tool> [args...]` / `call <wrapper>` | Call a tool, or run a wrapper |
 | `auth [flags] <name>` | Store OAuth credentials for a URL server |
 | `logout <name>` | Delete stored credentials |
 | `help [command]` | Show help |

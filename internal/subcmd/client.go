@@ -14,6 +14,7 @@ import (
 	"github.com/fpt/go-mcpproxy/internal/app"
 	"github.com/fpt/go-mcpproxy/internal/config"
 	"github.com/fpt/go-mcpproxy/internal/hub"
+	"github.com/fpt/go-mcpproxy/internal/wrapper"
 	"github.com/google/subcommands"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -75,20 +76,27 @@ func (p *ToolsCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subco
 	if err != nil {
 		return fail(err)
 	}
+	cfg, err := env.load()
+	if err != nil {
+		return fail(err)
+	}
 	names := f.Args()
 	if len(names) == 0 {
-		cfg, err := env.load()
-		if err != nil {
-			return fail(err)
-		}
-		if names = cfg.Names(); len(names) == 0 {
-			return fail(errors.New("no servers are configured (add one with `mcpproxy add`)"))
+		names = append(cfg.Names(), cfg.WrapperNames()...)
+		if len(names) == 0 {
+			return fail(
+				errors.New("nothing is configured (see `mcpproxy add` and `mcpproxy wrap`)"),
+			)
 		}
 	}
 
 	var tools []mcp.Tool
 	status := subcommands.ExitSuccess
 	for _, name := range names {
+		if w, ok := cfg.Wrapper[name]; ok {
+			tools = append(tools, wrapper.Tool(name, w))
+			continue
+		}
 		up, err := connect(ctx, env, name, p.verbose)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "mcpproxy: %s: %v\n", name, err)
@@ -129,8 +137,10 @@ func (*CallCmd) Name() string     { return "call" }
 func (*CallCmd) Synopsis() string { return "Call a tool of an MCP server." }
 func (*CallCmd) Usage() string {
 	return `call [flags] <name> <tool> [arguments...]
-call [flags] <name>__<tool> [arguments...]:
-  Call a tool of a configured server and print the result. Arguments are
+call [flags] <name>__<tool> [arguments...]
+call [flags] <wrapper>:
+  Call a tool of a configured server and print the result, or run a wrapper
+  tool, passing its stdout and stderr through and exiting with its exit code. Arguments are
   checked against the tool's input schema before calling. The exit status is
   1 if the tool reports an error.
 
@@ -155,6 +165,9 @@ func (p *CallCmd) SetFlags(f *flag.FlagSet) {
 }
 
 func (p *CallCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+	if st, ok := p.runWrapper(ctx, f.Args()); ok {
+		return st
+	}
 	name, tool, rest, err := splitCallArgs(f.Args())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mcpproxy: %v\n\n", err)
@@ -204,6 +217,52 @@ func (p *CallCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcom
 		return subcommands.ExitFailure
 	}
 	return subcommands.ExitSuccess
+}
+
+// runWrapper runs args[0] if it names a wrapper tool, passing its stdout and
+// stderr through and exiting with its exit code (1 if it did not exit).
+// ok is false if args[0] is not a wrapper.
+func (p *CallCmd) runWrapper(ctx context.Context, args []string) (subcommands.ExitStatus, bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	env, err := newEnvironment()
+	if err != nil {
+		return fail(err), true
+	}
+	cfg, err := env.load()
+	if err != nil {
+		return fail(err), true
+	}
+	w, ok := cfg.Wrapper[args[0]]
+	if !ok {
+		return 0, false
+	}
+	if len(args) > 1 {
+		return fail(fmt.Errorf("wrapper tool %q takes no arguments", args[0])), true
+	}
+	if p.timeout > 0 && (w.Timeout == 0 || p.timeout < w.Timeout) {
+		w.Timeout = p.timeout
+	}
+	res := wrapper.Run(ctx, w)
+	if p.json {
+		if st := printJSON(res); st != subcommands.ExitSuccess {
+			return st, true
+		}
+	} else {
+		fmt.Print(res.Stdout)
+		fmt.Fprint(os.Stderr, res.Stderr)
+		if res.StdoutTruncated || res.StderrTruncated {
+			fmt.Fprintln(os.Stderr, "mcpproxy: output was truncated (see max_output)")
+		}
+	}
+	if res.Error != "" {
+		fmt.Fprintln(os.Stderr, "mcpproxy:", res.Error)
+	}
+	if res.ExitCode < 0 {
+		return subcommands.ExitFailure, true
+	}
+	return subcommands.ExitStatus(res.ExitCode), true
 }
 
 // splitCallArgs accepts "<name> <tool> args..." or "<name>__<tool> args...".

@@ -250,3 +250,58 @@ func TestStdioCommands(t *testing.T) {
 	st, _ = run(t, &subcmd.CallCmd{}, "three", "echo")
 	assert.Equal(t, subcommands.ExitFailure, st, "unknown server")
 }
+
+func TestWrapCommands(t *testing.T) {
+	path := setConfig(t)
+	dir := t.TempDir()
+
+	st, out := run(t, &subcmd.WrapCmd{}, "-dir", dir, "-timeout", "1m", "hello",
+		"echo hello; echo oops >&2; exit 4")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "added: hello\twrapper: echo hello; echo oops >&2; exit 4\n", out)
+
+	st, out = run(t, &subcmd.WrapCmd{}, "words", "--", "printf", "%s|", "a b", "it's")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "added: words\twrapper: printf '%s|' 'a b' 'it'\\''s'\n", out)
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "[wrapper.hello]")
+	assert.Contains(t, string(data), `timeout = "1m0s"`)
+
+	st, out = run(t, &subcmd.LsCmd{})
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "hello\twrapper: echo hello; echo oops >&2; exit 4\n"+
+		"words\twrapper: printf '%s|' 'a b' 'it'\\''s'\n", out)
+
+	// call passes stdout through and exits with the command's exit code.
+	st, out = run(t, &subcmd.CallCmd{}, "hello")
+	assert.Equal(t, subcommands.ExitStatus(4), st)
+	assert.Equal(t, "hello\n", out)
+
+	st, out = run(t, &subcmd.CallCmd{}, "words")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Equal(t, "a b|it's|", out, "shell quoting round-trips")
+
+	st, out = run(t, &subcmd.CallCmd{}, "-json", "hello")
+	assert.Equal(t, subcommands.ExitStatus(4), st)
+	assert.Contains(t, out, `"stderr": "oops\n"`)
+
+	st, _ = run(t, &subcmd.CallCmd{}, "hello", "extra")
+	assert.Equal(t, subcommands.ExitFailure, st, "wrappers take no arguments")
+
+	st, out = run(t, &subcmd.ToolsCmd{}, "hello")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.True(t, strings.HasPrefix(out, "hello\tRun `echo hello;"), out)
+
+	st, _ = run(t, &subcmd.WrapCmd{}, "bad__name", "true")
+	assert.NotEqual(t, subcommands.ExitSuccess, st)
+	st, _ = run(t, &subcmd.WrapCmd{}, "two", "a", "b")
+	assert.NotEqual(t, subcommands.ExitSuccess, st, "several words need --")
+
+	st, _ = run(t, &subcmd.RmCmd{}, "hello", "words")
+	require.Equal(t, subcommands.ExitSuccess, st)
+	st, out = run(t, &subcmd.LsCmd{})
+	require.Equal(t, subcommands.ExitSuccess, st)
+	assert.Empty(t, out)
+}

@@ -157,11 +157,11 @@ func (p *AddCmd) server(target []string) (config.Server, error) {
 type RmCmd struct{}
 
 func (*RmCmd) Name() string     { return "rm" }
-func (*RmCmd) Synopsis() string { return "Remove MCP servers." }
+func (*RmCmd) Synopsis() string { return "Remove MCP servers or wrapper tools." }
 func (*RmCmd) Usage() string {
 	return `rm <name>...:
-  Remove servers from the config. A running "mcpproxy serve" stops them
-  automatically. Stored OAuth credentials are kept; see "mcpproxy logout".
+  Remove servers or wrapper tools from the config. A running "mcpproxy serve"
+  applies the change automatically. Stored OAuth credentials are kept; see "mcpproxy logout".
 `
 }
 
@@ -181,10 +181,13 @@ func (p *RmCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommand
 		return fail(err)
 	}
 	for _, name := range f.Args() {
-		if _, ok := cfg.Servers[name]; !ok {
-			return fail(fmt.Errorf("no server named %q", name))
+		_, isServer := cfg.Servers[name]
+		_, isWrapper := cfg.Wrapper[name]
+		if !isServer && !isWrapper {
+			return fail(fmt.Errorf("no server or wrapper named %q", name))
 		}
 		delete(cfg.Servers, name)
+		delete(cfg.Wrapper, name)
 	}
 	if err := cfg.Save(env.cfgPath); err != nil {
 		return fail(err)
@@ -201,10 +204,11 @@ type LsCmd struct {
 }
 
 func (*LsCmd) Name() string     { return "ls" }
-func (*LsCmd) Synopsis() string { return "List MCP servers." }
+func (*LsCmd) Synopsis() string { return "List MCP servers and wrapper tools." }
 func (*LsCmd) Usage() string {
 	return `ls [-v]:
-  Print the configured servers, one per line: name, then command or URL.
+  Print the configured servers, one per line: name, then command or URL,
+  followed by the wrapper tools: name, then "wrapper: <shell command>".
 `
 }
 
@@ -230,6 +234,14 @@ func (p *LsCmd) Execute(context.Context, *flag.FlagSet, ...any) subcommands.Exit
 		line := name + "\t" + srv.String()
 		if p.verbose {
 			line += p.note(env, srv)
+		}
+		fmt.Println(line)
+	}
+	for _, name := range cfg.WrapperNames() {
+		w := cfg.Wrapper[name]
+		line := name + "\twrapper: " + w.Command
+		if p.verbose && w.Dir != "" {
+			line += "\t(in " + w.Dir + ")"
 		}
 		fmt.Println(line)
 	}

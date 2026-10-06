@@ -18,9 +18,10 @@ func main() {
 	subcommands.Register(&subcmd.CallCmd{}, "client")
 	subcommands.Register(&subcmd.AuthCmd{}, "client")
 	subcommands.Register(&subcmd.LogoutCmd{}, "client")
-	subcommands.Register(&subcmd.AddCmd{}, "allowlist")
-	subcommands.Register(&subcmd.RmCmd{}, "allowlist")
-	subcommands.Register(&subcmd.LsCmd{}, "allowlist")
+	subcommands.Register(&subcmd.AddCmd{}, "config")
+	subcommands.Register(&subcmd.RmCmd{}, "config")
+	subcommands.Register(&subcmd.LsCmd{}, "config")
+	subcommands.Register(&subcmd.WrapCmd{}, "config")
 
 	flag.Parse()
 	ctx := context.Background()
